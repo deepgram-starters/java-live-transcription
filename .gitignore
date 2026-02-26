@@ -1,0 +1,21 @@
+# Maven build output
+target/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Frontend build artifacts (managed by submodule)
+frontend/node_modules/
+frontend/dist/
