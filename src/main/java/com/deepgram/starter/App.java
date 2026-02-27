@@ -31,9 +31,9 @@ import io.github.cdimascio.dotenv.Dotenv;
 import io.javalin.Javalin;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
-import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.api.StatusCode;
+import org.eclipse.jetty.websocket.api.WebSocketAdapter;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.slf4j.Logger;
@@ -528,7 +528,7 @@ public class App {
      * Jetty WebSocket endpoint that connects to Deepgram and forwards messages
      * bidirectionally with the client WebSocket.
      */
-    static class DeepgramEndpoint extends org.eclipse.jetty.websocket.api.Session.Listener.Abstract {
+    static class DeepgramEndpoint extends WebSocketAdapter {
 
         private final WsContext clientCtx;
         private final String connectionId;
@@ -544,8 +544,8 @@ public class App {
         }
 
         @Override
-        public void onWebSocketOpen(Session session) {
-            super.onWebSocketOpen(session);
+        public void onWebSocketConnect(Session session) {
+            super.onWebSocketConnect(session);
             this.dgSession = session;
             openLatch.countDown();
         }
@@ -569,24 +569,22 @@ public class App {
         }
 
         @Override
-        public void onWebSocketBinary(ByteBuffer payload, Callback callback) {
+        public void onWebSocketBinary(byte[] payload, int offset, int len) {
             // Forward binary messages from Deepgram to client
             dgToClientCount++;
             if (dgToClientCount % 100 == 0) {
                 log.debug("[{}] deepgram->client #{} (binary, size: {})",
-                    connectionId, dgToClientCount, payload.remaining());
+                    connectionId, dgToClientCount, len);
             }
 
             try {
                 if (clientCtx.session.isOpen()) {
-                    byte[] data = new byte[payload.remaining()];
-                    payload.get(data);
+                    byte[] data = new byte[len];
+                    System.arraycopy(payload, offset, data, 0, len);
                     clientCtx.send(ByteBuffer.wrap(data));
                 }
-                callback.succeed();
             } catch (Exception e) {
                 log.error("[{}] Error forwarding binary to client: {}", connectionId, e.getMessage());
-                callback.fail(e);
             }
         }
 
@@ -627,7 +625,11 @@ public class App {
         void sendText(String text) {
             if (isOpen()) {
                 clientToDgCount++;
-                dgSession.sendText(text, Callback.NOOP);
+                try {
+                    dgSession.getRemote().sendString(text);
+                } catch (Exception e) {
+                    log.error("[{}] Error sending text to Deepgram: {}", connectionId, e.getMessage());
+                }
             }
         }
 
@@ -635,14 +637,18 @@ public class App {
         void sendBinary(byte[] data) {
             if (isOpen()) {
                 clientToDgCount++;
-                dgSession.sendBinary(ByteBuffer.wrap(data), Callback.NOOP);
+                try {
+                    dgSession.getRemote().sendBytes(ByteBuffer.wrap(data));
+                } catch (Exception e) {
+                    log.error("[{}] Error sending binary to Deepgram: {}", connectionId, e.getMessage());
+                }
             }
         }
 
         /** Closes the Deepgram WebSocket connection. */
         void close(int code, String reason) {
             if (isOpen()) {
-                dgSession.close(code, reason, Callback.NOOP);
+                dgSession.close(code, reason);
             }
         }
     }
