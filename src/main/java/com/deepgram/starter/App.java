@@ -33,6 +33,7 @@ import com.auth0.jwt.JWTVerifier;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.deepgram.DeepgramClient;
+import com.deepgram.core.ObjectMappers;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStreamType;
 import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
@@ -88,8 +89,13 @@ public class App {
     /** JWT verifier. */
     private static JWTVerifier jwtVerifier;
 
-    /** Jackson ObjectMapper for JSON serialization. */
-    private static final ObjectMapper jsonMapper = new ObjectMapper();
+    /**
+     * Jackson ObjectMapper for serializing outbound SDK response objects.
+     * Uses the Deepgram SDK's own configured mapper so that JDK8 types on the
+     * generated response models (e.g. {@code Optional<Boolean>} on
+     * {@code ListenV1Results.is_final}) serialize correctly.
+     */
+    private static final ObjectMapper jsonMapper = ObjectMappers.JSON_MAPPER;
 
     // ========================================================================
     // ENTRY POINT
