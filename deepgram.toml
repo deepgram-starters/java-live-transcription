@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/java-live-transcription"
 useCase = "live-transcription"
 language = "Java"
 framework = "Javalin"
-sdk = "N/A"
+sdk = "deepgram-java-sdk"
 tags = ["live-transcription", "live-stt", "real-time-transcription", "real-time-asr", "streaming-transcription", "live-speech-to-text", "java", "javalin"]
 
 [check]

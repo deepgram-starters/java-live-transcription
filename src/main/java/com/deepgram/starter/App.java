@@ -1,21 +1,28 @@
 /**
  * Java Live Transcription Starter - Backend Server
  *
- * A WebSocket proxy server that transparently forwards audio and transcription
- * messages between browser clients and Deepgram's Live Speech-to-Text API.
+ * A WebSocket bridge server that forwards audio and transcription messages
+ * between browser clients and Deepgram's Live Speech-to-Text API. The Deepgram
+ * side is handled by the official Deepgram Java SDK
+ * (`client.listen().v1().v1WebSocket()`), which manages the connection, auth,
+ * and message framing.
  *
  * Key Features:
- * - WebSocket proxy: /api/live-transcription -> wss://api.deepgram.com/v1/listen
- * - Bidirectional message forwarding (binary audio + JSON results)
+ * - WebSocket bridge: /api/live-transcription -> Deepgram Live STT (via SDK)
+ * - Bidirectional forwarding (binary audio in, JSON results out)
  * - JWT session auth via Sec-WebSocket-Protocol subprotocol
  * - Metadata endpoint: GET /api/metadata
  * - CORS enabled for frontend communication
  * - Graceful shutdown with connection tracking
  *
+ * The SDK's typed result/metadata objects serialize to the exact Deepgram wire
+ * JSON (`type`, `channel`, `is_final`, `speech_final`, ...), so the browser
+ * frontend receives the same messages as before and needs no changes.
+ *
  * Routes:
  *   GET  /api/session              - Issue JWT session token
  *   GET  /api/metadata             - Project metadata from deepgram.toml
- *   WS   /api/live-transcription   - WebSocket proxy to Deepgram STT (auth required)
+ *   WS   /api/live-transcription   - WebSocket bridge to Deepgram STT (auth required)
  *   GET  /health                   - Health check
  */
 
@@ -25,31 +32,32 @@ import com.auth0.jwt.JWT;
 import com.auth0.jwt.JWTVerifier;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
+import com.deepgram.DeepgramClient;
+import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
+import com.deepgram.resources.listen.v1.types.ListenV1CloseStreamType;
+import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
+import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
+import com.deepgram.types.ListenV1Channels;
+import com.deepgram.types.ListenV1Encoding;
+import com.deepgram.types.ListenV1Language;
+import com.deepgram.types.ListenV1Model;
+import com.deepgram.types.ListenV1SampleRate;
+import com.deepgram.types.ListenV1SmartFormat;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.toml.TomlMapper;
 import io.github.cdimascio.dotenv.Dotenv;
 import io.javalin.Javalin;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
-import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.StatusCode;
-import org.eclipse.jetty.websocket.api.WebSocketAdapter;
-import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
-import org.eclipse.jetty.websocket.client.WebSocketClient;
+import okio.ByteString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 // ============================================================================
 // MAIN APPLICATION
@@ -63,7 +71,6 @@ public class App {
     // CONFIGURATION
     // ========================================================================
 
-    private static final String DEEPGRAM_STT_URL = "wss://api.deepgram.com/v1/listen";
     private static final int JWT_EXPIRY_SECONDS = 3600; // 1 hour
 
     /** Reserved WebSocket close codes that must not be sent by applications. */
@@ -72,11 +79,8 @@ public class App {
     /** Track active client WebSocket sessions for graceful shutdown. */
     private static final Map<String, WsContext> activeConnections = new ConcurrentHashMap<>();
 
-    /** Shared Jetty WebSocket client for outbound connections to Deepgram. */
-    private static WebSocketClient jettyWsClient;
-
-    /** Deepgram API key loaded from environment. */
-    private static String deepgramApiKey;
+    /** Shared Deepgram SDK client for outbound connections to Deepgram. */
+    private static DeepgramClient deepgram;
 
     /** JWT signing algorithm. */
     private static Algorithm jwtAlgorithm;
@@ -97,7 +101,7 @@ public class App {
         Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
 
         // Load configuration from environment
-        deepgramApiKey = dotenv.get("DEEPGRAM_API_KEY");
+        String deepgramApiKey = dotenv.get("DEEPGRAM_API_KEY");
         if (deepgramApiKey == null || deepgramApiKey.isBlank()) {
             log.error("");
             log.error("ERROR: Deepgram API key not found!");
@@ -141,17 +145,15 @@ public class App {
         jwtVerifier = JWT.require(jwtAlgorithm).build();
 
         // ====================================================================
-        // JETTY WEBSOCKET CLIENT SETUP
+        // DEEPGRAM SDK CLIENT SETUP
         // ====================================================================
 
-        jettyWsClient = new WebSocketClient();
-        jettyWsClient.start();
+        deepgram = DeepgramClient.builder().apiKey(deepgramApiKey).build();
 
         // ====================================================================
         // JAVALIN SERVER SETUP
         // ====================================================================
 
-        final int finalPort = port;
         final String finalHost = host;
 
         Javalin app = Javalin.create(config -> {
@@ -222,63 +224,84 @@ public class App {
                 String sampleRate = paramOrDefault(clientCtx.queryParam("sample_rate"), "16000");
                 String channels = paramOrDefault(clientCtx.queryParam("channels"), "1");
 
-                // Build Deepgram URL with query parameters
-                String deepgramUrl = buildDeepgramUrl(model, language, smartFormat, encoding, sampleRate, channels);
-
                 log.info("[{}] Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
                     connectionId, model, language, encoding, sampleRate, channels);
 
-                // Connect to Deepgram using Jetty WebSocket client
-                try {
-                    URI dgUri = new URI(deepgramUrl);
-                    ClientUpgradeRequest upgradeRequest = new ClientUpgradeRequest();
-                    upgradeRequest.setHeader("Authorization", "Token " + deepgramApiKey);
+                // Create a per-connection Deepgram SDK WebSocket client.
+                V1WebSocketClient dg = deepgram.listen().v1().v1WebSocket();
+                SttBridge bridge = new SttBridge(dg, connectionId);
+                clientCtx.attribute("bridge", bridge);
 
-                    // Latch to wait for Deepgram connection to open
-                    CountDownLatch openLatch = new CountDownLatch(1);
+                // Deepgram -> browser. The SDK's typed objects serialize to the same
+                // Deepgram wire JSON the frontend already parses (type/channel/is_final/...).
+                dg.onConnected(() -> log.info("[{}] Connected to Deepgram STT API", connectionId));
+                dg.onResults(results -> forwardJson(clientCtx, connectionId, results));
+                dg.onMetadata(metadata -> forwardJson(clientCtx, connectionId, metadata));
+                dg.onUtteranceEnd(utteranceEnd -> forwardJson(clientCtx, connectionId, utteranceEnd));
+                dg.onSpeechStarted(speechStarted -> forwardJson(clientCtx, connectionId, speechStarted));
 
-                    DeepgramEndpoint dgEndpoint = new DeepgramEndpoint(clientCtx, connectionId, openLatch);
-                    jettyWsClient.connect(dgEndpoint, dgUri, upgradeRequest);
+                dg.onError(error -> {
+                    log.error("[{}] Deepgram WebSocket error: {}", connectionId, error.getMessage());
+                    try {
+                        if (clientCtx.session.isOpen()) {
+                            clientCtx.closeSession(1011, "Deepgram connection error");
+                        }
+                    } catch (Exception e) {
+                        log.error("[{}] Error closing client after Deepgram error: {}", connectionId, e.getMessage());
+                    }
+                });
 
-                    // Wait for the Deepgram connection to be established (up to 10 seconds)
-                    if (!openLatch.await(10, TimeUnit.SECONDS)) {
-                        log.error("[{}] Timeout connecting to Deepgram", connectionId);
-                        clientCtx.closeSession(1011, "Timeout connecting to Deepgram");
+                dg.onDisconnected(reason -> {
+                    log.info("[{}] Deepgram connection closed: {} {}", connectionId, reason.getCode(), reason.getReason());
+                    try {
+                        if (clientCtx.session.isOpen()) {
+                            int safeCode = getSafeCloseCode(reason.getCode());
+                            clientCtx.closeSession(safeCode,
+                                reason.getReason() != null ? reason.getReason() : "Deepgram connection closed");
+                        }
+                    } catch (Exception e) {
+                        log.error("[{}] Error closing client after Deepgram close: {}", connectionId, e.getMessage());
+                    }
+                });
+
+                // Build connection options from the frontend's query parameters.
+                V1ConnectOptions options = V1ConnectOptions.builder()
+                    .model(ListenV1Model.valueOf(model))
+                    .language(ListenV1Language.of(language))
+                    .encoding(ListenV1Encoding.valueOf(encoding))
+                    .sampleRate(ListenV1SampleRate.of(Integer.parseInt(sampleRate)))
+                    .channels(ListenV1Channels.of(Integer.parseInt(channels)))
+                    .smartFormat(ListenV1SmartFormat.valueOf(smartFormat))
+                    .build();
+
+                dg.connect(options).whenComplete((v, err) -> {
+                    if (err != null) {
+                        log.error("[{}] Failed to connect to Deepgram: {}", connectionId, err.getMessage());
+                        try {
+                            if (clientCtx.session.isOpen()) {
+                                clientCtx.closeSession(1011, "Failed to connect to Deepgram");
+                            }
+                        } catch (Exception ignored) {}
                         activeConnections.remove(connectionId);
                         return;
                     }
-
-                    // Store the Deepgram session on the client context for message forwarding
-                    clientCtx.attribute("deepgramEndpoint", dgEndpoint);
-
-                    log.info("[{}] Connected to Deepgram STT API", connectionId);
-
-                } catch (Exception e) {
-                    log.error("[{}] Failed to connect to Deepgram: {}", connectionId, e.getMessage());
-                    clientCtx.closeSession(1011, "Failed to connect to Deepgram");
-                    activeConnections.remove(connectionId);
-                }
+                    // Flush any audio the browser sent before the Deepgram socket opened.
+                    bridge.markReady();
+                });
             });
 
             ws.onMessage(clientCtx -> {
-                // Forward text messages from client to Deepgram
+                // The frontend streams only binary audio; text control frames are
+                // not used by this app. Log and ignore anything unexpected.
                 String connectionId = clientCtx.attribute("connectionId");
-                DeepgramEndpoint dgEndpoint = clientCtx.attribute("deepgramEndpoint");
-
-                if (dgEndpoint != null && dgEndpoint.isOpen()) {
-                    String text = clientCtx.message();
-                    dgEndpoint.sendText(text);
-                }
+                log.debug("[{}] Ignoring unexpected text message from client", connectionId);
             });
 
             ws.onBinaryMessage(clientCtx -> {
-                // Forward binary messages (audio) from client to Deepgram
-                String connectionId = clientCtx.attribute("connectionId");
-                DeepgramEndpoint dgEndpoint = clientCtx.attribute("deepgramEndpoint");
-
-                if (dgEndpoint != null && dgEndpoint.isOpen()) {
-                    byte[] data = clientCtx.data();
-                    dgEndpoint.sendBinary(data);
+                // Forward binary audio from the client to Deepgram.
+                SttBridge bridge = clientCtx.attribute("bridge");
+                if (bridge != null) {
+                    bridge.sendAudio(ByteString.of(clientCtx.data()));
                 }
             });
 
@@ -289,10 +312,11 @@ public class App {
                 log.info("[{}] Client disconnected: {} {}", connectionId,
                     clientCtx.status(), clientCtx.reason());
 
-                // Close Deepgram connection when client disconnects
-                DeepgramEndpoint dgEndpoint = clientCtx.attribute("deepgramEndpoint");
-                if (dgEndpoint != null && dgEndpoint.isOpen()) {
-                    dgEndpoint.close(StatusCode.NORMAL, "Client disconnected");
+                // Close the Deepgram connection when the client disconnects.
+                SttBridge bridge = clientCtx.attribute("bridge");
+                if (bridge != null) {
+                    bridge.closeStream();
+                    bridge.disconnect();
                 }
 
                 activeConnections.remove(connectionId);
@@ -306,10 +330,10 @@ public class App {
                 log.error("[{}] Client WebSocket error: {}", connectionId,
                     clientCtx.error() != null ? clientCtx.error().getMessage() : "unknown");
 
-                // Close Deepgram connection on client error
-                DeepgramEndpoint dgEndpoint = clientCtx.attribute("deepgramEndpoint");
-                if (dgEndpoint != null && dgEndpoint.isOpen()) {
-                    dgEndpoint.close(StatusCode.SERVER_ERROR, "Client error");
+                // Close the Deepgram connection on client error.
+                SttBridge bridge = clientCtx.attribute("bridge");
+                if (bridge != null) {
+                    bridge.disconnect();
                 }
 
                 activeConnections.remove(connectionId);
@@ -333,14 +357,6 @@ public class App {
                 } catch (Exception e) {
                     log.error("Error closing connection {}: {}", entry.getKey(), e.getMessage());
                 }
-            }
-
-            try {
-                if (jettyWsClient != null) {
-                    jettyWsClient.stop();
-                }
-            } catch (Exception e) {
-                log.error("Error stopping WebSocket client: {}", e.getMessage());
             }
 
             log.info("All connections closed.");
@@ -465,20 +481,18 @@ public class App {
     // ========================================================================
 
     /**
-     * Builds the Deepgram WebSocket URL with query parameters.
-     *
-     * @return full Deepgram URL string with query parameters
+     * Serializes a Deepgram SDK event object to JSON and forwards it to the
+     * browser client as a text frame. The SDK types serialize to the same wire
+     * format Deepgram sends, so the frontend needs no changes.
      */
-    private static String buildDeepgramUrl(String model, String language, String smartFormat,
-                                            String encoding, String sampleRate, String channels) {
-        StringBuilder sb = new StringBuilder(DEEPGRAM_STT_URL);
-        sb.append("?model=").append(urlEncode(model));
-        sb.append("&language=").append(urlEncode(language));
-        sb.append("&smart_format=").append(urlEncode(smartFormat));
-        sb.append("&encoding=").append(urlEncode(encoding));
-        sb.append("&sample_rate=").append(urlEncode(sampleRate));
-        sb.append("&channels=").append(urlEncode(channels));
-        return sb.toString();
+    private static void forwardJson(WsContext clientCtx, String connectionId, Object message) {
+        try {
+            if (clientCtx.session.isOpen()) {
+                clientCtx.send(jsonMapper.writeValueAsString(message));
+            }
+        } catch (Exception e) {
+            log.error("[{}] Error forwarding message to client: {}", connectionId, e.getMessage());
+        }
     }
 
     /**
@@ -486,13 +500,6 @@ public class App {
      */
     private static String paramOrDefault(String value, String defaultValue) {
         return (value != null && !value.isBlank()) ? value : defaultValue;
-    }
-
-    /**
-     * URL-encodes a string value.
-     */
-    private static String urlEncode(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
     /**
@@ -506,7 +513,7 @@ public class App {
         if (code >= 1000 && code <= 4999 && !RESERVED_CLOSE_CODES.contains(code)) {
             return code;
         }
-        return StatusCode.NORMAL;
+        return 1000;
     }
 
     /**
@@ -521,134 +528,68 @@ public class App {
     }
 
     // ========================================================================
-    // DEEPGRAM WEBSOCKET ENDPOINT (Jetty client-side)
+    // DEEPGRAM WEBSOCKET BRIDGE (SDK client-side)
     // ========================================================================
 
     /**
-     * Jetty WebSocket endpoint that connects to Deepgram and forwards messages
-     * bidirectionally with the client WebSocket.
+     * Per-connection bridge to a Deepgram Live STT WebSocket. Buffers audio that
+     * arrives from the browser before the Deepgram socket has finished opening.
      */
-    static class DeepgramEndpoint extends WebSocketAdapter {
+    static final class SttBridge {
 
-        private final WsContext clientCtx;
+        private final V1WebSocketClient dg;
         private final String connectionId;
-        private final CountDownLatch openLatch;
-        private Session dgSession;
-        private long dgToClientCount = 0;
-        private long clientToDgCount = 0;
+        private boolean ready = false;
+        private final List<ByteString> pending = new ArrayList<>();
 
-        DeepgramEndpoint(WsContext clientCtx, String connectionId, CountDownLatch openLatch) {
-            this.clientCtx = clientCtx;
+        SttBridge(V1WebSocketClient dg, String connectionId) {
+            this.dg = dg;
             this.connectionId = connectionId;
-            this.openLatch = openLatch;
         }
 
-        @Override
-        public void onWebSocketConnect(Session session) {
-            super.onWebSocketConnect(session);
-            this.dgSession = session;
-            openLatch.countDown();
-        }
-
-        @Override
-        public void onWebSocketText(String message) {
-            // Forward text messages from Deepgram to client
-            dgToClientCount++;
-            if (dgToClientCount % 10 == 0 || dgToClientCount <= 3) {
-                log.debug("[{}] deepgram->client #{} (text, size: {})",
-                    connectionId, dgToClientCount, message.length());
+        /** Forwards an audio chunk to Deepgram, buffering until the socket is open. */
+        synchronized void sendAudio(ByteString audio) {
+            if (!ready) {
+                pending.add(audio);
+                return;
             }
-
             try {
-                if (clientCtx.session.isOpen()) {
-                    clientCtx.send(message);
-                }
+                dg.sendMedia(audio);
             } catch (Exception e) {
-                log.error("[{}] Error forwarding text to client: {}", connectionId, e.getMessage());
+                log.error("[{}] Error sending audio to Deepgram: {}", connectionId, e.getMessage());
             }
         }
 
-        @Override
-        public void onWebSocketBinary(byte[] payload, int offset, int len) {
-            // Forward binary messages from Deepgram to client
-            dgToClientCount++;
-            if (dgToClientCount % 100 == 0) {
-                log.debug("[{}] deepgram->client #{} (binary, size: {})",
-                    connectionId, dgToClientCount, len);
-            }
-
-            try {
-                if (clientCtx.session.isOpen()) {
-                    byte[] data = new byte[len];
-                    System.arraycopy(payload, offset, data, 0, len);
-                    clientCtx.send(ByteBuffer.wrap(data));
-                }
-            } catch (Exception e) {
-                log.error("[{}] Error forwarding binary to client: {}", connectionId, e.getMessage());
-            }
-        }
-
-        @Override
-        public void onWebSocketClose(int statusCode, String reason) {
-            log.info("[{}] Deepgram connection closed: {} {}", connectionId, statusCode, reason);
-
-            // Close client connection when Deepgram disconnects
-            try {
-                if (clientCtx.session.isOpen()) {
-                    int safeCode = getSafeCloseCode(statusCode);
-                    clientCtx.closeSession(safeCode, reason != null ? reason : "Deepgram connection closed");
-                }
-            } catch (Exception e) {
-                log.error("[{}] Error closing client after Deepgram close: {}", connectionId, e.getMessage());
-            }
-        }
-
-        @Override
-        public void onWebSocketError(Throwable cause) {
-            log.error("[{}] Deepgram WebSocket error: {}", connectionId, cause.getMessage());
-
-            try {
-                if (clientCtx.session.isOpen()) {
-                    clientCtx.closeSession(1011, "Deepgram connection error");
-                }
-            } catch (Exception e) {
-                log.error("[{}] Error closing client after Deepgram error: {}", connectionId, e.getMessage());
-            }
-        }
-
-        /** Checks if the Deepgram WebSocket session is open. */
-        boolean isOpen() {
-            return dgSession != null && dgSession.isOpen();
-        }
-
-        /** Sends a text message to Deepgram. */
-        void sendText(String text) {
-            if (isOpen()) {
-                clientToDgCount++;
+        /** Marks the Deepgram socket ready and flushes any buffered audio. */
+        synchronized void markReady() {
+            ready = true;
+            for (ByteString audio : pending) {
                 try {
-                    dgSession.getRemote().sendString(text);
+                    dg.sendMedia(audio);
                 } catch (Exception e) {
-                    log.error("[{}] Error sending text to Deepgram: {}", connectionId, e.getMessage());
+                    log.error("[{}] Error flushing buffered audio to Deepgram: {}", connectionId, e.getMessage());
                 }
+            }
+            pending.clear();
+        }
+
+        /** Signals end-of-stream to Deepgram so it can flush final results. */
+        void closeStream() {
+            try {
+                dg.sendCloseStream(ListenV1CloseStream.builder()
+                    .type(ListenV1CloseStreamType.CLOSE_STREAM)
+                    .build());
+            } catch (Exception ignored) {
+                // socket may already be closed
             }
         }
 
-        /** Sends binary data to Deepgram. */
-        void sendBinary(byte[] data) {
-            if (isOpen()) {
-                clientToDgCount++;
-                try {
-                    dgSession.getRemote().sendBytes(ByteBuffer.wrap(data));
-                } catch (Exception e) {
-                    log.error("[{}] Error sending binary to Deepgram: {}", connectionId, e.getMessage());
-                }
-            }
-        }
-
-        /** Closes the Deepgram WebSocket connection. */
-        void close(int code, String reason) {
-            if (isOpen()) {
-                dgSession.close(code, reason);
+        /** Tears down the Deepgram WebSocket connection. */
+        void disconnect() {
+            try {
+                dg.disconnect();
+            } catch (Exception ignored) {
+                // already closed
             }
         }
     }
