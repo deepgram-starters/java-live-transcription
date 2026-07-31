@@ -230,6 +230,28 @@ public class App {
                 String sampleRate = paramOrDefault(clientCtx.queryParam("sample_rate"), "16000");
                 String channels = paramOrDefault(clientCtx.queryParam("channels"), "1");
 
+                // Validate the numeric query params up front: ListenV1SampleRate.of /
+                // ListenV1Channels.of take ints, so a non-numeric value would throw
+                // NumberFormatException out of onConnect — after activeConnections.put
+                // and after the SDK client is created — leaking the map entry and
+                // orphaning the client. Fail cleanly here instead, before creating it.
+                int sampleRateValue;
+                int channelsValue;
+                try {
+                    sampleRateValue = Integer.parseInt(sampleRate);
+                    channelsValue = Integer.parseInt(channels);
+                } catch (NumberFormatException e) {
+                    log.warn("[{}] Invalid sample_rate/channels query param: sample_rate={}, channels={}",
+                        connectionId, sampleRate, channels);
+                    try {
+                        if (clientCtx.session.isOpen()) {
+                            clientCtx.closeSession(1011, "Invalid sample_rate/channels");
+                        }
+                    } catch (Exception ignored) {}
+                    activeConnections.remove(connectionId);
+                    return;
+                }
+
                 log.info("[{}] Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
                     connectionId, model, language, encoding, sampleRate, channels);
 
@@ -239,7 +261,12 @@ public class App {
                 clientCtx.attribute("bridge", bridge);
 
                 // Deepgram -> browser. The SDK's typed objects serialize to the same
-                // Deepgram wire JSON the frontend already parses (type/channel/is_final/...).
+                // fields the frontend parses (type/channel/is_final/...), duplicate
+                // `type` key and number normalization aside — the Fern-generated 0.7.1
+                // models emit `type` both as a discriminator and via their
+                // @JsonAnyGetter bag, so the round-trip is not byte-identical to
+                // Deepgram's wire JSON. Benign for the reference frontend (JS keeps the
+                // last duplicate key); an upstream SDK serialization issue to track.
                 dg.onConnected(() -> log.info("[{}] Connected to Deepgram STT API", connectionId));
                 dg.onResults(results -> forwardJson(clientCtx, connectionId, results));
                 dg.onMetadata(metadata -> forwardJson(clientCtx, connectionId, metadata));
@@ -275,8 +302,8 @@ public class App {
                     .model(ListenV1Model.valueOf(model))
                     .language(ListenV1Language.of(language))
                     .encoding(ListenV1Encoding.valueOf(encoding))
-                    .sampleRate(ListenV1SampleRate.of(Integer.parseInt(sampleRate)))
-                    .channels(ListenV1Channels.of(Integer.parseInt(channels)))
+                    .sampleRate(ListenV1SampleRate.of(sampleRateValue))
+                    .channels(ListenV1Channels.of(channelsValue))
                     .smartFormat(ListenV1SmartFormat.valueOf(smartFormat))
                     .build();
 
