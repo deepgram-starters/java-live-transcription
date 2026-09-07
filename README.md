@@ -15,7 +15,7 @@ Click the button below to fork the repo:
 - JDK 21 or later. Verify with `java --version`.
 - Maven 3.9 or later.
 - Git.
-- Node.js with Corepack enabled. Run `corepack enable` to provide pnpm for the frontend install.
+- Node.js 20.19+ or 22.12+ with Corepack enabled. Run `corepack enable` to provide pnpm for the frontend install.
 
 ### Makefile (Recommended)
 
