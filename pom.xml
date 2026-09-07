@@ -19,6 +19,13 @@
     </properties>
 
     <dependencies>
+        <!-- Deepgram Java SDK (provides client.listen().v1().v1WebSocket()) -->
+        <dependency>
+            <groupId>com.deepgram</groupId>
+            <artifactId>deepgram-java-sdk</artifactId>
+            <version>0.7.1</version>
+        </dependency>
+
         <!-- Javalin web framework -->
         <dependency>
             <groupId>io.javalin</groupId>
@@ -68,16 +75,28 @@
             <version>2.0.16</version>
         </dependency>
 
-        <!-- Jetty WebSocket client for outbound connections to Deepgram (must match Javalin's Jetty 11) -->
         <dependency>
-            <groupId>org.eclipse.jetty.websocket</groupId>
-            <artifactId>websocket-jetty-client</artifactId>
-            <version>11.0.24</version>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.4</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.20.0</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
             <!-- Maven Shade Plugin: create fat jar with all dependencies -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
