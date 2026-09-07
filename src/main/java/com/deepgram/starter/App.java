@@ -280,14 +280,10 @@ public class App {
                 dg.onMessage(raw -> forwardRaw(clientCtx, connectionId, raw));
 
                 dg.onError(error -> {
-                    log.error("[{}] Deepgram WebSocket error: {}", connectionId, error.getMessage());
-                    try {
-                        if (clientCtx.session.isOpen()) {
-                            clientCtx.closeSession(1011, "Deepgram connection error");
-                        }
-                    } catch (Exception e) {
-                        log.error("[{}] Error closing client after Deepgram error: {}", connectionId, e.getMessage());
-                    }
+                    // SDK decoding errors can follow a raw, unmodeled event. The raw
+                    // handler already forwarded it, so wait for onDisconnected before
+                    // treating the upstream connection as closed.
+                    log.warn("[{}] Deepgram WebSocket error: {}", connectionId, error.getMessage());
                 });
 
                 dg.onDisconnected(reason -> {
@@ -543,7 +539,11 @@ public class App {
         try {
             if (clientCtx.session.isOpen()) {
                 clientCtx.send(jsonMapper.writeValueAsString(Map.of(
-                    "type", "Error", "description", description, "code", code)));
+                    "type", "Error",
+                    "error", Map.of(
+                        "type", "ClientMessage",
+                        "code", code,
+                        "message", description))));
             }
         } catch (Exception e) {
             log.error("Error sending client error: {}", e.getMessage());
