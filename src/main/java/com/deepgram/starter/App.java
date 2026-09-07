@@ -15,9 +15,9 @@
  * - CORS enabled for frontend communication
  * - Graceful shutdown with connection tracking
  *
- * The SDK's typed result/metadata objects serialize to the exact Deepgram wire
- * JSON (`type`, `channel`, `is_final`, `speech_final`, ...), so the browser
- * frontend receives the same messages as before and needs no changes.
+ * The SDK preserves the fields consumed by the reference frontend; its
+ * serialized output is semantically compatible with, but not byte-identical
+ * to, Deepgram's wire JSON.
  *
  * Routes:
  *   GET  /api/session              - Issue JWT session token
@@ -36,6 +36,10 @@ import com.deepgram.DeepgramClient;
 import com.deepgram.core.ObjectMappers;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStreamType;
+import com.deepgram.resources.listen.v1.types.ListenV1Finalize;
+import com.deepgram.resources.listen.v1.types.ListenV1FinalizeType;
+import com.deepgram.resources.listen.v1.types.ListenV1KeepAlive;
+import com.deepgram.resources.listen.v1.types.ListenV1KeepAliveType;
 import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.deepgram.types.ListenV1Channels;
@@ -73,6 +77,8 @@ public class App {
     // ========================================================================
 
     private static final int JWT_EXPIRY_SECONDS = 3600; // 1 hour
+    private static final int MAX_PENDING_FRAMES = 128;
+    private static final long MAX_PENDING_BYTES = 512 * 1024;
 
     /** Reserved WebSocket close codes that must not be sent by applications. */
     private static final Set<Integer> RESERVED_CLOSE_CODES = Set.of(1004, 1005, 1006, 1015);
@@ -257,7 +263,15 @@ public class App {
 
                 // Create a per-connection Deepgram SDK WebSocket client.
                 V1WebSocketClient dg = deepgram.listen().v1().v1WebSocket();
-                SttBridge bridge = new SttBridge(dg, connectionId);
+                SttBridge bridge = new SttBridge(dg, connectionId, () -> {
+                    try {
+                        if (clientCtx.session.isOpen()) {
+                            clientCtx.closeSession(1013, "Deepgram connection is not ready");
+                        }
+                    } catch (Exception ignored) {}
+                    dg.disconnect();
+                    activeConnections.remove(connectionId);
+                });
                 clientCtx.attribute("bridge", bridge);
 
                 // Deepgram -> browser. The SDK's typed objects serialize to the same
@@ -310,6 +324,7 @@ public class App {
                 dg.connect(options).whenComplete((v, err) -> {
                     if (err != null) {
                         log.error("[{}] Failed to connect to Deepgram: {}", connectionId, err.getMessage());
+                        bridge.discardPending();
                         try {
                             if (clientCtx.session.isOpen()) {
                                 clientCtx.closeSession(1011, "Failed to connect to Deepgram");
@@ -324,10 +339,18 @@ public class App {
             });
 
             ws.onMessage(clientCtx -> {
-                // The frontend streams only binary audio; text control frames are
-                // not used by this app. Log and ignore anything unexpected.
                 String connectionId = clientCtx.attribute("connectionId");
-                log.debug("[{}] Ignoring unexpected text message from client", connectionId);
+                SttBridge bridge = clientCtx.attribute("bridge");
+                if (bridge == null) return;
+                try {
+                    String type = jsonMapper.readTree(clientCtx.message()).path("type").asText("");
+                    if (!bridge.sendControl(type)) {
+                        sendClientError(clientCtx, "Unsupported control message", "INVALID_CLIENT_MESSAGE");
+                    }
+                } catch (Exception e) {
+                    log.warn("[{}] Invalid client control message", connectionId, e);
+                    sendClientError(clientCtx, "Client message must be valid JSON", "INVALID_CLIENT_MESSAGE");
+                }
             });
 
             ws.onBinaryMessage(clientCtx -> {
@@ -516,7 +539,7 @@ public class App {
     /**
      * Serializes a Deepgram SDK event object to JSON and forwards it to the
      * browser client as a text frame. The SDK types serialize to the same wire
-     * format Deepgram sends, so the frontend needs no changes.
+     * fields consumed by the frontend, so the frontend needs no changes.
      */
     private static void forwardJson(WsContext clientCtx, String connectionId, Object message) {
         try {
@@ -525,6 +548,17 @@ public class App {
             }
         } catch (Exception e) {
             log.error("[{}] Error forwarding message to client: {}", connectionId, e.getMessage());
+        }
+    }
+
+    private static void sendClientError(WsContext clientCtx, String description, String code) {
+        try {
+            if (clientCtx.session.isOpen()) {
+                clientCtx.send(jsonMapper.writeValueAsString(Map.of(
+                    "type", "Error", "description", description, "code", code)));
+            }
+        } catch (Exception e) {
+            log.error("Error sending client error: {}", e.getMessage());
         }
     }
 
@@ -565,45 +599,89 @@ public class App {
     // ========================================================================
 
     /**
-     * Per-connection bridge to a Deepgram Live STT WebSocket. Buffers audio that
-     * arrives from the browser before the Deepgram socket has finished opening.
+     * Per-connection bridge to a Deepgram Live STT WebSocket. Frames received
+     * before the Deepgram socket opens are queued in arrival order with bounds.
      */
     static final class SttBridge {
 
         private final V1WebSocketClient dg;
         private final String connectionId;
+        private final Runnable onOverload;
         private boolean ready = false;
-        private final List<ByteString> pending = new ArrayList<>();
+        private boolean closed = false;
+        private long pendingBytes = 0;
+        private final List<PendingFrame> pending = new ArrayList<>();
 
-        SttBridge(V1WebSocketClient dg, String connectionId) {
+        private sealed interface PendingFrame permits PendingAudio, PendingControl {}
+        private record PendingAudio(ByteString audio) implements PendingFrame {}
+        private record PendingControl(String type) implements PendingFrame {}
+
+        SttBridge(V1WebSocketClient dg, String connectionId, Runnable onOverload) {
             this.dg = dg;
             this.connectionId = connectionId;
+            this.onOverload = onOverload;
         }
 
         /** Forwards an audio chunk to Deepgram, buffering until the socket is open. */
         synchronized void sendAudio(ByteString audio) {
+            if (closed) return;
             if (!ready) {
-                pending.add(audio);
+                enqueue(new PendingAudio(audio), audio.size());
                 return;
             }
+            sendFrame(new PendingAudio(audio));
+        }
+
+        synchronized boolean sendControl(String type) {
+            if (closed || !Set.of("KeepAlive", "Finalize", "CloseStream").contains(type)) return false;
+            PendingControl control = new PendingControl(type);
+            if (!ready) return enqueue(control, 0);
+            sendFrame(control);
+            return true;
+        }
+
+        private boolean enqueue(PendingFrame frame, long bytes) {
+            if (pending.size() >= MAX_PENDING_FRAMES || pendingBytes + bytes > MAX_PENDING_BYTES) {
+                closed = true;
+                discardPending();
+                onOverload.run();
+                return false;
+            }
+            pending.add(frame);
+            pendingBytes += bytes;
+            return true;
+        }
+
+        private void sendFrame(PendingFrame frame) {
             try {
-                dg.sendMedia(audio);
+                if (frame instanceof PendingAudio audio) {
+                    dg.sendMedia(audio.audio());
+                } else if (frame instanceof PendingControl control) {
+                    switch (control.type()) {
+                        case "KeepAlive" -> dg.sendKeepAlive(ListenV1KeepAlive.builder()
+                            .type(ListenV1KeepAliveType.KEEP_ALIVE).build());
+                        case "Finalize" -> dg.sendFinalize(ListenV1Finalize.builder()
+                            .type(ListenV1FinalizeType.FINALIZE).build());
+                        case "CloseStream" -> closeStream();
+                        default -> throw new IllegalStateException("Unknown control message");
+                    }
+                }
             } catch (Exception e) {
-                log.error("[{}] Error sending audio to Deepgram: {}", connectionId, e.getMessage());
+                log.error("[{}] Error sending frame to Deepgram: {}", connectionId, e.getMessage());
             }
         }
 
         /** Marks the Deepgram socket ready and flushes any buffered audio. */
         synchronized void markReady() {
+            if (closed) return;
             ready = true;
-            for (ByteString audio : pending) {
-                try {
-                    dg.sendMedia(audio);
-                } catch (Exception e) {
-                    log.error("[{}] Error flushing buffered audio to Deepgram: {}", connectionId, e.getMessage());
-                }
-            }
+            for (PendingFrame frame : pending) sendFrame(frame);
+            discardPending();
+        }
+
+        synchronized void discardPending() {
             pending.clear();
+            pendingBytes = 0;
         }
 
         /** Signals end-of-stream to Deepgram so it can flush final results. */
@@ -619,6 +697,8 @@ public class App {
 
         /** Tears down the Deepgram WebSocket connection. */
         void disconnect() {
+            discardPending();
+            closed = true;
             try {
                 dg.disconnect();
             } catch (Exception ignored) {
