@@ -274,18 +274,10 @@ public class App {
                 });
                 clientCtx.attribute("bridge", bridge);
 
-                // Deepgram -> browser. The SDK's typed objects serialize to the same
-                // fields the frontend parses (type/channel/is_final/...), duplicate
-                // `type` key and number normalization aside — the Fern-generated 0.7.1
-                // models emit `type` both as a discriminator and via their
-                // @JsonAnyGetter bag, so the round-trip is not byte-identical to
-                // Deepgram's wire JSON. Benign for the reference frontend (JS keeps the
-                // last duplicate key); an upstream SDK serialization issue to track.
+                // Deepgram -> browser. Forward raw JSON before the SDK's typed dispatch
+                // so Error and newly introduced events retain their original payload.
                 dg.onConnected(() -> log.info("[{}] Connected to Deepgram STT API", connectionId));
-                dg.onResults(results -> forwardJson(clientCtx, connectionId, results));
-                dg.onMetadata(metadata -> forwardJson(clientCtx, connectionId, metadata));
-                dg.onUtteranceEnd(utteranceEnd -> forwardJson(clientCtx, connectionId, utteranceEnd));
-                dg.onSpeechStarted(speechStarted -> forwardJson(clientCtx, connectionId, speechStarted));
+                dg.onMessage(raw -> forwardRaw(clientCtx, connectionId, raw));
 
                 dg.onError(error -> {
                     log.error("[{}] Deepgram WebSocket error: {}", connectionId, error.getMessage());
@@ -536,18 +528,14 @@ public class App {
     // HELPER FUNCTIONS
     // ========================================================================
 
-    /**
-     * Serializes a Deepgram SDK event object to JSON and forwards it to the
-     * browser client as a text frame. The SDK types serialize to the same wire
-     * fields consumed by the frontend, so the frontend needs no changes.
-     */
-    private static void forwardJson(WsContext clientCtx, String connectionId, Object message) {
+    /** Forwards raw Deepgram JSON to the browser without reserialization. */
+    private static void forwardRaw(WsContext clientCtx, String connectionId, String message) {
         try {
             if (clientCtx.session.isOpen()) {
-                clientCtx.send(jsonMapper.writeValueAsString(message));
+                clientCtx.send(message);
             }
         } catch (Exception e) {
-            log.error("[{}] Error forwarding message to client: {}", connectionId, e.getMessage());
+            log.error("[{}] Error forwarding raw message to client: {}", connectionId, e.getMessage());
         }
     }
 

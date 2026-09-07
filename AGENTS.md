@@ -85,7 +85,9 @@ Frontend: `cd frontend && corepack pnpm install`
 ## Customization Guide
 
 ### Changing Default Parameters
-The WebSocket connection URL passes parameters to Deepgram. Find where the Deepgram WebSocket URL is constructed in the backend and modify defaults:
+The browser passes parameters to this starter's WebSocket endpoint. The backend
+maps them to typed SDK connection options in `V1ConnectOptions.builder()` in
+`App.java`; modify that builder to change the defaults sent to Deepgram:
 
 | Parameter | Default | Options | Effect |
 |-----------|---------|---------|--------|
@@ -97,7 +99,8 @@ The WebSocket connection URL passes parameters to Deepgram. Find where the Deepg
 | `channels` | `1` | `1`, `2` | Mono or stereo |
 
 ### Adding More Deepgram Features via Query Params
-These can be appended to the Deepgram WebSocket URL as query parameters:
+Add browser query parameters to this starter's WebSocket URL, then explicitly
+map each supported value to the matching `V1ConnectOptions.builder()` method:
 
 | Feature | Parameter | Example | Effect |
 |---------|-----------|---------|--------|
@@ -110,7 +113,11 @@ These can be appended to the Deepgram WebSocket URL as query parameters:
 | Keywords | `keywords` | `deepgram:2` | Boost keyword with weight |
 | No delay | `no_delay` | `true` | Minimize latency (may reduce accuracy) |
 
-**Backend:** Append params to the Deepgram URL in the WebSocket proxy handler.
+**Backend:** Read the browser value in `App.java` and add the corresponding
+typed SDK option. For example, use
+`.endpointing(ListenV1Endpointing.of(Integer.parseInt(endpointing)))` after
+validating an `endpointing` query parameter. Do not construct an upstream
+Deepgram URL manually.
 
 **Frontend:** The frontend sends these as query params when opening the WebSocket. To add a UI control for a new param, edit `frontend/main.js` — add an input/checkbox and include it in the `URLSearchParams` when connecting.
 
