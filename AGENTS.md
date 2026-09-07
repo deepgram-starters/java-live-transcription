@@ -111,15 +111,13 @@ map each supported value to the matching `V1ConnectOptions.builder()` method:
 | Diarization | `diarize` | `true` | Speaker identification |
 | Punctuation | `punctuate` | `true` | Auto-punctuation |
 | Keywords | `keywords` | `deepgram:2` | Boost keyword with weight |
-| No delay | `no_delay` | `true` | Minimize latency (may reduce accuracy) |
 
 **Backend:** Use a typed `V1ConnectOptions.builder()` option when the SDK
 models it. For accepted options not modeled in SDK 0.7.1, use
 `.additionalProperty("option_name", value)` instead. For example, use
 `.endpointing(ListenV1Endpointing.of(Integer.parseInt(endpointing)))` after
-validating an `endpointing` query parameter, or
-`.additionalProperty("no_delay", true)` for `no_delay`. Do not construct an
-upstream Deepgram URL manually.
+validating an `endpointing` query parameter. Do not construct an upstream
+Deepgram URL manually.
 
 **Frontend:** The frontend sends these as query params when opening the WebSocket. To add a UI control for a new param, edit `frontend/main.js` — add an input/checkbox and include it in the `URLSearchParams` when connecting.
 

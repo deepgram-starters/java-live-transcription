@@ -29,6 +29,18 @@ class SttBridgeTest {
     }
 
     @Test
+    void capsBytesQueuedBeforeConnection() {
+        AtomicBoolean overloaded = new AtomicBoolean();
+        App.SttBridge bridge = new App.SttBridge(null, "test", () -> overloaded.set(true));
+
+        bridge.sendAudio(ByteString.of(new byte[512 * 1024]));
+        bridge.sendAudio(ByteString.of(new byte[] {1}));
+
+        assertTrue(overloaded.get());
+        assertFalse(bridge.sendControl("Finalize"));
+    }
+
+    @Test
     void acceptsDocumentedControlsBeforeConnection() {
         App.SttBridge bridge = new App.SttBridge(null, "test", () -> {});
 

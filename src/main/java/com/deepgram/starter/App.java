@@ -34,6 +34,7 @@ import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.deepgram.DeepgramClient;
 import com.deepgram.core.ObjectMappers;
+import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStreamType;
 import com.deepgram.resources.listen.v1.types.ListenV1Finalize;
@@ -277,13 +278,28 @@ public class App {
                 // Deepgram -> browser. Forward raw JSON before the SDK's typed dispatch
                 // so Error and newly introduced events retain their original payload.
                 dg.onConnected(() -> log.info("[{}] Connected to Deepgram STT API", connectionId));
-                dg.onMessage(raw -> forwardRaw(clientCtx, connectionId, raw));
+                dg.onMessage(raw -> {
+                    if (!isModeledInboundEvent(raw)) {
+                        bridge.expectDecoderError();
+                    }
+                    forwardRaw(clientCtx, connectionId, raw);
+                });
 
                 dg.onError(error -> {
-                    // SDK decoding errors can follow a raw, unmodeled event. The raw
-                    // handler already forwarded it, so wait for onDisconnected before
-                    // treating the upstream connection as closed.
-                    log.warn("[{}] Deepgram WebSocket error: {}", connectionId, error.getMessage());
+                    if (bridge.consumeExpectedDecoderError()) {
+                        log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
+                        return;
+                    }
+                    log.error("[{}] Deepgram transport error: {}", connectionId, error.getMessage());
+                    bridge.disconnect();
+                    activeConnections.remove(connectionId);
+                    try {
+                        if (clientCtx.session.isOpen()) {
+                            clientCtx.closeSession(1011, "Deepgram connection lost");
+                        }
+                    } catch (Exception e) {
+                        log.error("[{}] Error closing client after Deepgram error: {}", connectionId, e.getMessage());
+                    }
                 });
 
                 dg.onDisconnected(reason -> {
@@ -309,6 +325,9 @@ public class App {
                     .smartFormat(ListenV1SmartFormat.valueOf(smartFormat))
                     .build();
 
+                dg.reconnectOptions(ReconnectingWebSocketListener.ReconnectOptions.builder()
+                    .maxRetries(0)
+                    .build());
                 dg.connect(options).whenComplete((v, err) -> {
                     if (err != null) {
                         log.error("[{}] Failed to connect to Deepgram: {}", connectionId, err.getMessage());
@@ -535,6 +554,15 @@ public class App {
         }
     }
 
+    private static boolean isModeledInboundEvent(String raw) {
+        try {
+            return Set.of("Results", "Metadata", "UtteranceEnd", "SpeechStarted")
+                .contains(jsonMapper.readTree(raw).path("type").asText());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private static void sendClientError(WsContext clientCtx, String description, String code) {
         try {
             if (clientCtx.session.isOpen()) {
@@ -597,6 +625,7 @@ public class App {
         private final Runnable onOverload;
         private boolean ready = false;
         private boolean closed = false;
+        private boolean expectingDecoderError = false;
         private long pendingBytes = 0;
         private final List<PendingFrame> pending = new ArrayList<>();
 
@@ -626,6 +655,16 @@ public class App {
             if (!ready) return enqueue(control, 0);
             sendFrame(control);
             return true;
+        }
+
+        synchronized void expectDecoderError() {
+            expectingDecoderError = true;
+        }
+
+        synchronized boolean consumeExpectedDecoderError() {
+            boolean expected = expectingDecoderError;
+            expectingDecoderError = false;
+            return expected;
         }
 
         private boolean enqueue(PendingFrame frame, long bytes) {
