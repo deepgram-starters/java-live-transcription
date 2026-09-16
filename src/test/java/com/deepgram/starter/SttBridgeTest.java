@@ -2,12 +2,14 @@ package com.deepgram.starter;
 
 import okio.ByteString;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
@@ -67,5 +69,14 @@ class SttBridgeTest {
         order.verify(deepgram).sendKeepAlive(any());
         order.verify(deepgram).sendFinalize(any());
         order.verify(deepgram).sendCloseStream(any());
+    }
+
+    @Test
+    void clientErrorsIncludeTheFrontendDescription() throws Exception {
+        var frame = new ObjectMapper().readTree(App.clientErrorFrame("Invalid JSON", "INVALID_JSON"));
+
+        assertEquals("Error", frame.path("type").asText());
+        assertEquals("Invalid JSON", frame.path("description").asText());
+        assertEquals("Invalid JSON", frame.path("error").path("message").asText());
     }
 }

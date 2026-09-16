@@ -49,6 +49,7 @@ import com.deepgram.types.ListenV1Language;
 import com.deepgram.types.ListenV1Model;
 import com.deepgram.types.ListenV1SampleRate;
 import com.deepgram.types.ListenV1SmartFormat;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.toml.TomlMapper;
 import io.github.cdimascio.dotenv.Dotenv;
@@ -563,15 +564,20 @@ public class App {
         }
     }
 
+    static String clientErrorFrame(String description, String code) throws JsonProcessingException {
+        return jsonMapper.writeValueAsString(Map.of(
+            "type", "Error",
+            "description", description,
+            "error", Map.of(
+                "type", "ClientMessage",
+                "code", code,
+                "message", description)));
+    }
+
     private static void sendClientError(WsContext clientCtx, String description, String code) {
         try {
             if (clientCtx.session.isOpen()) {
-                clientCtx.send(jsonMapper.writeValueAsString(Map.of(
-                    "type", "Error",
-                    "error", Map.of(
-                        "type", "ClientMessage",
-                        "code", code,
-                        "message", description))));
+                clientCtx.send(clientErrorFrame(description, code));
             }
         } catch (Exception e) {
             log.error("Error sending client error: {}", e.getMessage());
