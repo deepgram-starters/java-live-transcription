@@ -33,6 +33,7 @@ import com.auth0.jwt.JWTVerifier;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.deepgram.DeepgramClient;
+import com.deepgram.core.DeepgramHttpException;
 import com.deepgram.core.ObjectMappers;
 import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
@@ -291,11 +292,13 @@ public class App {
                         log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
                         return;
                     }
-                    log.error("[{}] Deepgram transport error: {}", connectionId, error.getMessage());
+                    String description = safeDeepgramConnectionError(error);
+                    log.error("[{}] Deepgram transport error: {}", connectionId, description);
                     bridge.disconnect();
                     activeConnections.remove(connectionId);
                     try {
                         if (clientCtx.session.isOpen()) {
+                            sendClientError(clientCtx, description, "CONNECTION_FAILED");
                             clientCtx.closeSession(1011, "Deepgram connection lost");
                         }
                     } catch (Exception e) {
@@ -572,6 +575,14 @@ public class App {
                 "type", "ClientMessage",
                 "code", code,
                 "message", description)));
+    }
+
+    /** Returns provider connection errors without exposing SDK request details. */
+    static String safeDeepgramConnectionError(Throwable error) {
+        if (error instanceof DeepgramHttpException httpError) {
+            return "Deepgram rejected the connection (HTTP " + httpError.statusCode() + ")";
+        }
+        return "Failed to connect to Deepgram (" + error.getClass().getSimpleName() + ")";
     }
 
     private static void sendClientError(WsContext clientCtx, String description, String code) {

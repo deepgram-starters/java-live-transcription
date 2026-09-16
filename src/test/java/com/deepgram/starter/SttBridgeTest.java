@@ -1,6 +1,7 @@
 package com.deepgram.starter;
 
 import okio.ByteString;
+import com.deepgram.core.DeepgramHttpException;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -78,5 +79,19 @@ class SttBridgeTest {
         assertEquals("Error", frame.path("type").asText());
         assertEquals("Invalid JSON", frame.path("description").asText());
         assertEquals("Invalid JSON", frame.path("error").path("message").asText());
+    }
+
+    @Test
+    void authenticationFailuresSendASanitizedBrowserErrorFrame() throws Exception {
+        String secret = "test-connect-secret";
+        var error = new DeepgramHttpException("Authorization: Token " + secret, 401, null);
+        var frame = new ObjectMapper().readTree(App.clientErrorFrame(
+            App.safeDeepgramConnectionError(error), "CONNECTION_FAILED"));
+
+        assertEquals("Error", frame.path("type").asText());
+        assertEquals("Deepgram rejected the connection (HTTP 401)", frame.path("description").asText());
+        assertEquals("CONNECTION_FAILED", frame.path("error").path("code").asText());
+        assertFalse(frame.toString().contains(secret));
+        assertFalse(frame.toString().contains("Authorization"));
     }
 }
