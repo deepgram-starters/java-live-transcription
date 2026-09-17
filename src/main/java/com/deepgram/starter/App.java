@@ -55,6 +55,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.toml.TomlMapper;
 import io.github.cdimascio.dotenv.Dotenv;
 import io.javalin.Javalin;
+import org.eclipse.jetty.websocket.api.WriteCallback;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
 import okio.ByteString;
@@ -66,6 +67,7 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 // ============================================================================
 // MAIN APPLICATION
@@ -275,6 +277,7 @@ public class App {
                     dg.disconnect();
                     activeConnections.remove(connectionId);
                 });
+                AtomicBoolean connectionFailureReported = new AtomicBoolean();
                 clientCtx.attribute("bridge", bridge);
 
                 // Deepgram -> browser. Forward raw JSON before the SDK's typed dispatch
@@ -294,20 +297,15 @@ public class App {
                     }
                     String description = safeDeepgramConnectionError(error);
                     log.error("[{}] Deepgram transport error: {}", connectionId, description);
-                    bridge.disconnect();
-                    activeConnections.remove(connectionId);
-                    try {
-                        if (clientCtx.session.isOpen()) {
-                            sendClientError(clientCtx, description, "CONNECTION_FAILED");
-                            clientCtx.closeSession(1011, "Deepgram connection lost");
-                        }
-                    } catch (Exception e) {
-                        log.error("[{}] Error closing client after Deepgram error: {}", connectionId, e.getMessage());
-                    }
+                    reportConnectionFailure(clientCtx, bridge, connectionId, description,
+                        connectionFailureReported, activeConnections);
                 });
 
                 dg.onDisconnected(reason -> {
                     log.info("[{}] Deepgram connection closed: {} {}", connectionId, reason.getCode(), reason.getReason());
+                    // SDK handshake failures emit close before error; wait for that error so the
+                    // browser receives a useful Error frame instead of an unexplained close.
+                    if (!bridge.isReady() || connectionFailureReported.get()) return;
                     try {
                         if (clientCtx.session.isOpen()) {
                             int safeCode = getSafeCloseCode(reason.getCode());
@@ -334,14 +332,10 @@ public class App {
                     .build());
                 dg.connect(options).whenComplete((v, err) -> {
                     if (err != null) {
-                        log.error("[{}] Failed to connect to Deepgram: {}", connectionId, err.getMessage());
-                        bridge.discardPending();
-                        try {
-                            if (clientCtx.session.isOpen()) {
-                                clientCtx.closeSession(1011, "Failed to connect to Deepgram");
-                            }
-                        } catch (Exception ignored) {}
-                        activeConnections.remove(connectionId);
+                        String description = safeDeepgramConnectionError(err);
+                        log.error("[{}] Failed to connect to Deepgram: {}", connectionId, description);
+                        reportConnectionFailure(clientCtx, bridge, connectionId, description,
+                            connectionFailureReported, activeConnections);
                         return;
                     }
                     // Flush any audio the browser sent before the Deepgram socket opened.
@@ -435,10 +429,6 @@ public class App {
 
         app.start(port);
 
-        String secretPreview = sessionSecret.length() >= 16
-            ? sessionSecret.substring(0, 16) + "..."
-            : sessionSecret + "...";
-
         log.info("");
         log.info("======================================================================");
         log.info("Backend API Server running at http://localhost:{}", port);
@@ -448,7 +438,7 @@ public class App {
         log.info("  GET  /api/metadata");
         log.info("  GET  /health");
         log.info("");
-        log.info("Session secret: {} (first 16 chars)", secretPreview);
+        log.info("Session authentication configured");
         log.info("======================================================================");
         log.info("");
     }
@@ -579,10 +569,61 @@ public class App {
 
     /** Returns provider connection errors without exposing SDK request details. */
     static String safeDeepgramConnectionError(Throwable error) {
-        if (error instanceof DeepgramHttpException httpError) {
-            return "Deepgram rejected the connection (HTTP " + httpError.statusCode() + ")";
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof DeepgramHttpException httpError) {
+                return "Deepgram rejected the connection (HTTP " + httpError.statusCode() + ")";
+            }
         }
-        return "Failed to connect to Deepgram (" + error.getClass().getSimpleName() + ")";
+        return "Failed to connect to Deepgram";
+    }
+
+    private static void reportConnectionFailure(
+        WsContext clientCtx,
+        SttBridge bridge,
+        String connectionId,
+        String description,
+        AtomicBoolean reported,
+        Map<String, WsContext> activeConnections
+    ) {
+        if (!reported.compareAndSet(false, true)) return;
+        bridge.discardPending();
+        try {
+            if (!clientCtx.session.isOpen()) {
+                bridge.disconnect();
+                activeConnections.remove(connectionId);
+                return;
+            }
+            clientCtx.session.getRemote().sendString(clientErrorFrame(description, "CONNECTION_FAILED"), new WriteCallback() {
+                @Override
+                public void writeSuccess() {
+                    closeAfterConnectionFailure(clientCtx, bridge, connectionId, activeConnections);
+                }
+
+                @Override
+                public void writeFailed(Throwable failure) {
+                    closeAfterConnectionFailure(clientCtx, bridge, connectionId, activeConnections);
+                }
+            });
+        } catch (Exception e) {
+            closeAfterConnectionFailure(clientCtx, bridge, connectionId, activeConnections);
+        }
+    }
+
+    private static void closeAfterConnectionFailure(
+        WsContext clientCtx,
+        SttBridge bridge,
+        String connectionId,
+        Map<String, WsContext> activeConnections
+    ) {
+        try {
+            if (clientCtx.session.isOpen()) {
+                clientCtx.closeSession(1011, "Deepgram connection lost");
+            }
+        } catch (Exception ignored) {
+            // The browser may have disconnected while the Error frame was in flight.
+        }
+        bridge.disconnect();
+        activeConnections.remove(connectionId);
     }
 
     private static void sendClientError(WsContext clientCtx, String description, String code) {
@@ -721,6 +762,10 @@ public class App {
             ready = true;
             for (PendingFrame frame : pending) sendFrame(frame);
             discardPending();
+        }
+
+        synchronized boolean isReady() {
+            return ready;
         }
 
         synchronized void discardPending() {

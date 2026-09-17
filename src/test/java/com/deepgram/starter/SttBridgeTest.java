@@ -84,7 +84,7 @@ class SttBridgeTest {
     @Test
     void authenticationFailuresSendASanitizedBrowserErrorFrame() throws Exception {
         String secret = "test-connect-secret";
-        var error = new DeepgramHttpException("Authorization: Token " + secret, 401, null);
+        var error = new RuntimeException(new DeepgramHttpException("Authorization: Token " + secret, 401, null));
         var frame = new ObjectMapper().readTree(App.clientErrorFrame(
             App.safeDeepgramConnectionError(error), "CONNECTION_FAILED"));
 
@@ -93,5 +93,10 @@ class SttBridgeTest {
         assertEquals("CONNECTION_FAILED", frame.path("error").path("code").asText());
         assertFalse(frame.toString().contains(secret));
         assertFalse(frame.toString().contains("Authorization"));
+    }
+
+    @Test
+    void connectionFailuresUseAGenericFallback() {
+        assertEquals("Failed to connect to Deepgram", App.safeDeepgramConnectionError(new RuntimeException("secret")));
     }
 }
