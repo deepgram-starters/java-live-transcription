@@ -571,13 +571,16 @@ public class App {
     static String safeDeepgramConnectionError(Throwable error) {
         for (Throwable cause = error; cause != null; cause = cause.getCause()) {
             if (cause instanceof DeepgramHttpException httpError) {
-                return "Deepgram rejected the connection (HTTP " + httpError.statusCode() + ")";
+                int statusCode = httpError.statusCode();
+                if (statusCode >= 100 && statusCode <= 599) {
+                    return "Deepgram rejected the connection (HTTP " + statusCode + ")";
+                }
             }
         }
         return "Failed to connect to Deepgram";
     }
 
-    private static void reportConnectionFailure(
+    static void reportConnectionFailure(
         WsContext clientCtx,
         SttBridge bridge,
         String connectionId,
