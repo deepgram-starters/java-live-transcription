@@ -1,16 +1,17 @@
 package com.deepgram.starter;
 
 import okio.ByteString;
-import com.deepgram.core.ClientOptions;
 import com.deepgram.core.DeepgramHttpException;
 import com.deepgram.core.Environment;
 import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.types.ListenV1Model;
+import com.deepgram.types.ListenV1InterimResults;
 import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.websocket.WsContext;
 import okhttp3.OkHttpClient;
+import okhttp3.Response;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import org.junit.jupiter.api.Test;
@@ -127,6 +128,19 @@ class SttBridgeTest {
     }
 
     @Test
+    void establishedConnectionFailuresDoNotClaimTheInitialConnectionFailed() {
+        assertEquals("Deepgram connection lost",
+            App.safeDeepgramConnectionError(new RuntimeException("secret"), null, true));
+    }
+
+    @Test
+    void requestsInterimResultsForTheSharedFrontend() {
+        V1ConnectOptions options = App.createConnectOptions("nova-3", "en", "linear16", 16_000, 1, "true");
+
+        assertEquals(ListenV1InterimResults.TRUE, options.getInterimResults().orElseThrow());
+    }
+
+    @Test
     void connectionFailuresOnlyExposeValidHttpStatuses() {
         assertEquals("Deepgram rejected the connection (HTTP 100)",
             App.safeDeepgramConnectionError(new DeepgramHttpException("secret", 100, null)));
@@ -165,6 +179,25 @@ class SttBridgeTest {
         assertErrorQueuedBeforeClose(fixture, "Deepgram rejected the connection (HTTP 503)", writeSucceeds);
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void establishedConnectionErrorsReportADisconnection() throws Exception {
+        FailureFixture fixture = failureFixture("established-connection-error");
+        CompletableFuture<Void> connection = new CompletableFuture<>();
+        V1ConnectOptions options = mock(V1ConnectOptions.class);
+        when(fixture.deepgram().connect(options)).thenReturn(connection);
+
+        App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
+            fixture.connectionId(), new App.HandshakeStatus(), new AtomicBoolean(), fixture.activeConnections());
+        ArgumentCaptor<Consumer<Exception>> errorHandler = ArgumentCaptor.forClass(Consumer.class);
+        verify(fixture.deepgram()).onError(errorHandler.capture());
+
+        connection.complete(null);
+        errorHandler.getValue().accept(new RuntimeException("secret"));
+
+        assertErrorQueuedBeforeClose(fixture, "Deepgram connection lost", true);
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void failedConnectCompletionQueuesErrorBeforeClosing(boolean writeSucceeds) throws Exception {
@@ -181,6 +214,57 @@ class SttBridgeTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void earlyDisconnectReportsAnErrorInsteadOfLeavingTheBrowserSilent() throws Exception {
+        FailureFixture fixture = failureFixture("early-disconnect");
+        var reason = mock(com.deepgram.core.DisconnectReason.class);
+
+        App.handleDeepgramDisconnect(reason, fixture.clientCtx(), fixture.bridge(), fixture.connectionId(),
+            new AtomicBoolean(), fixture.activeConnections());
+
+        ArgumentCaptor<String> frameCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<WriteCallback> callbackCaptor = ArgumentCaptor.forClass(WriteCallback.class);
+        verify(fixture.remote(), timeout(1_000)).sendString(frameCaptor.capture(), callbackCaptor.capture());
+        var frame = new ObjectMapper().readTree(frameCaptor.getValue());
+        assertEquals("Deepgram disconnected before the connection was ready", frame.path("description").asText());
+
+        callbackCaptor.getValue().writeSuccess();
+        verify(fixture.clientCtx(), timeout(1_000)).closeSession(1011, "Deepgram connection lost");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void earlyDisconnectPreservesTheFollowingHandshakeFailureStatus() throws Exception {
+        FailureFixture fixture = failureFixture("early-handshake-disconnect");
+        CompletableFuture<Void> connection = new CompletableFuture<>();
+        V1ConnectOptions options = mock(V1ConnectOptions.class);
+        when(fixture.deepgram().connect(options)).thenReturn(connection);
+        App.HandshakeStatus handshakeStatus = new App.HandshakeStatus();
+        AtomicBoolean reported = new AtomicBoolean();
+        Response response = mock(Response.class);
+        when(response.code()).thenReturn(401);
+        handshakeStatus.capture(response);
+
+        App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
+            fixture.connectionId(), handshakeStatus, reported, fixture.activeConnections());
+        ArgumentCaptor<Consumer<Exception>> errorHandler = ArgumentCaptor.forClass(Consumer.class);
+        verify(fixture.deepgram()).onError(errorHandler.capture());
+
+        App.handleDeepgramDisconnect(mock(com.deepgram.core.DisconnectReason.class), fixture.clientCtx(),
+            fixture.bridge(), fixture.connectionId(), reported, fixture.activeConnections());
+        errorHandler.getValue().accept(new RuntimeException("secret"));
+
+        ArgumentCaptor<String> frameCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<WriteCallback> callbackCaptor = ArgumentCaptor.forClass(WriteCallback.class);
+        verify(fixture.remote(), timeout(1_000)).sendString(frameCaptor.capture(), callbackCaptor.capture());
+        var frame = new ObjectMapper().readTree(frameCaptor.getValue());
+        assertEquals("Deepgram rejected the connection (HTTP 401)", frame.path("description").asText());
+
+        callbackCaptor.getValue().writeSuccess();
+        verify(fixture.clientCtx(), timeout(1_000)).closeSession(1011, "Deepgram connection lost");
+    }
+
+    @Test
     void invalidKeyHandshakeReportsCapturedStatusBeforeClosing() throws Exception {
         String apiKey = "deterministic-invalid-key";
         try (MockWebServer server = new MockWebServer()) {
@@ -188,11 +272,8 @@ class SttBridgeTest {
             server.start();
 
             App.HandshakeStatus handshakeStatus = new App.HandshakeStatus();
-            V1WebSocketClient deepgram = new V1WebSocketClient(ClientOptions.builder()
-                .environment(Environment.custom().production(server.url("/").toString()).build())
-                .addHeader("Authorization", "Token " + apiKey)
-                .webSocketFactory(new App.StatusCapturingWebSocketFactory(new OkHttpClient(), handshakeStatus))
-                .build());
+            V1WebSocketClient deepgram = App.createDeepgramWebSocketClient(apiKey, new OkHttpClient(),
+                handshakeStatus, Environment.custom().production(server.url("/").toString()).build());
             deepgram.reconnectOptions(ReconnectingWebSocketListener.ReconnectOptions.builder()
                 .maxRetries(0)
                 .build());

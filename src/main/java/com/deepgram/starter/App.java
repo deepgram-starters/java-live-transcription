@@ -36,6 +36,8 @@ import com.deepgram.DeepgramClient;
 import com.deepgram.DeepgramClientBuilder;
 import com.deepgram.core.ClientOptions;
 import com.deepgram.core.DeepgramHttpException;
+import com.deepgram.core.DisconnectReason;
+import com.deepgram.core.Environment;
 import com.deepgram.core.ObjectMappers;
 import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.core.WebSocketFactory;
@@ -49,6 +51,7 @@ import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.deepgram.types.ListenV1Channels;
 import com.deepgram.types.ListenV1Encoding;
+import com.deepgram.types.ListenV1InterimResults;
 import com.deepgram.types.ListenV1Language;
 import com.deepgram.types.ListenV1Model;
 import com.deepgram.types.ListenV1SampleRate;
@@ -74,6 +77,7 @@ import java.io.File;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -311,31 +315,12 @@ public class App {
                     forwardRaw(clientCtx, connectionId, raw);
                 });
 
-                dg.onDisconnected(reason -> {
-                    log.info("[{}] Deepgram connection closed: {} {}", connectionId, reason.getCode(), reason.getReason());
-                    // SDK handshake failures emit close before error; wait for that error so the
-                    // browser receives a useful Error frame instead of an unexplained close.
-                    if (!bridge.isReady() || connectionFailureReported.get()) return;
-                    try {
-                        if (clientCtx.session.isOpen()) {
-                            int safeCode = getSafeCloseCode(reason.getCode());
-                            clientCtx.closeSession(safeCode,
-                                reason.getReason() != null ? reason.getReason() : "Deepgram connection closed");
-                        }
-                    } catch (Exception e) {
-                        log.error("[{}] Error closing client after Deepgram close: {}", connectionId, e.getMessage());
-                    }
-                });
+                dg.onDisconnected(reason -> handleDeepgramDisconnect(reason, clientCtx, bridge,
+                    connectionId, connectionFailureReported, activeConnections));
 
                 // Build connection options from the frontend's query parameters.
-                V1ConnectOptions options = V1ConnectOptions.builder()
-                    .model(ListenV1Model.valueOf(model))
-                    .language(ListenV1Language.of(language))
-                    .encoding(ListenV1Encoding.valueOf(encoding))
-                    .sampleRate(ListenV1SampleRate.of(sampleRateValue))
-                    .channels(ListenV1Channels.of(channelsValue))
-                    .smartFormat(ListenV1SmartFormat.valueOf(smartFormat))
-                    .build();
+                V1ConnectOptions options = createConnectOptions(model, language, encoding,
+                    sampleRateValue, channelsValue, smartFormat);
 
                 dg.reconnectOptions(ReconnectingWebSocketListener.ReconnectOptions.builder()
                     .maxRetries(0)
@@ -574,6 +559,14 @@ public class App {
     }
 
     static String safeDeepgramConnectionError(Throwable error, HandshakeStatus handshakeStatus) {
+        return safeDeepgramConnectionError(error, handshakeStatus, false);
+    }
+
+    static String safeDeepgramConnectionError(
+        Throwable error,
+        HandshakeStatus handshakeStatus,
+        boolean connectionWasReady
+    ) {
         if (handshakeStatus != null) {
             OptionalInt statusCode = handshakeStatus.statusCode();
             if (statusCode.isPresent() && isHttpStatus(statusCode.getAsInt())) {
@@ -588,7 +581,26 @@ public class App {
                 }
             }
         }
-        return "Failed to connect to Deepgram";
+        return connectionWasReady ? "Deepgram connection lost" : "Failed to connect to Deepgram";
+    }
+
+    static V1ConnectOptions createConnectOptions(
+        String model,
+        String language,
+        String encoding,
+        int sampleRate,
+        int channels,
+        String smartFormat
+    ) {
+        return V1ConnectOptions.builder()
+            .model(ListenV1Model.valueOf(model))
+            .language(ListenV1Language.of(language))
+            .encoding(ListenV1Encoding.valueOf(encoding))
+            .sampleRate(ListenV1SampleRate.of(sampleRate))
+            .channels(ListenV1Channels.of(channels))
+            .smartFormat(ListenV1SmartFormat.valueOf(smartFormat))
+            .interimResults(ListenV1InterimResults.TRUE)
+            .build();
     }
 
     static void connectWithFailureReporting(
@@ -606,7 +618,7 @@ public class App {
                 log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
                 return;
             }
-            String description = safeDeepgramConnectionError(error, handshakeStatus);
+            String description = safeDeepgramConnectionError(error, handshakeStatus, bridge.isReady());
             log.error("[{}] Deepgram transport error: {}", connectionId, description);
             reportConnectionFailure(clientCtx, bridge, connectionId, description, reported, activeConnections);
         });
@@ -627,11 +639,56 @@ public class App {
     }
 
     private static V1WebSocketClient createDeepgramWebSocketClient(HandshakeStatus handshakeStatus) {
-        DeepgramClient client = new HandshakeAwareDeepgramClientBuilder(handshakeStatus)
-            .apiKey(deepgramApiKey)
-            .httpClient(deepgramWebSocketHttpClient)
-            .build();
+        return createDeepgramWebSocketClient(deepgramApiKey, deepgramWebSocketHttpClient,
+            handshakeStatus, null);
+    }
+
+    static V1WebSocketClient createDeepgramWebSocketClient(
+        String apiKey,
+        OkHttpClient httpClient,
+        HandshakeStatus handshakeStatus,
+        Environment environment
+    ) {
+        HandshakeAwareDeepgramClientBuilder builder = new HandshakeAwareDeepgramClientBuilder(
+            httpClient, handshakeStatus);
+        builder.apiKey(apiKey).httpClient(httpClient);
+        if (environment != null) {
+            builder.environment(environment);
+        }
+        DeepgramClient client = builder.build();
         return client.listen().v1().v1WebSocket();
+    }
+
+    static void handleDeepgramDisconnect(
+        DisconnectReason reason,
+        WsContext clientCtx,
+        SttBridge bridge,
+        String connectionId,
+        AtomicBoolean reported,
+        Map<String, WsContext> activeConnections
+    ) {
+        log.info("[{}] Deepgram connection closed: {} {}", connectionId, reason.getCode(), reason.getReason());
+        if (reported.get()) return;
+        if (!bridge.isReady()) {
+            // Handshake failures can deliver disconnect before onError. Let onError retain an
+            // HTTP status when available, then report an otherwise unexplained early close.
+            CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS).execute(() -> {
+                if (!bridge.isReady()) {
+                    reportConnectionFailure(clientCtx, bridge, connectionId,
+                        "Deepgram disconnected before the connection was ready", reported, activeConnections);
+                }
+            });
+            return;
+        }
+        try {
+            if (clientCtx.session.isOpen()) {
+                int safeCode = getSafeCloseCode(reason.getCode());
+                clientCtx.closeSession(safeCode,
+                    reason.getReason() != null ? reason.getReason() : "Deepgram connection closed");
+            }
+        } catch (Exception e) {
+            log.error("[{}] Error closing client after Deepgram close: {}", connectionId, e.getMessage());
+        }
     }
 
     /** Retains only a handshake response status so headers and bodies cannot be exposed later. */
@@ -652,9 +709,11 @@ public class App {
 
     /** Uses the SDK's documented builder extension point to install a per-connection factory. */
     private static final class HandshakeAwareDeepgramClientBuilder extends DeepgramClientBuilder {
+        private final OkHttpClient httpClient;
         private final HandshakeStatus handshakeStatus;
 
-        private HandshakeAwareDeepgramClientBuilder(HandshakeStatus handshakeStatus) {
+        private HandshakeAwareDeepgramClientBuilder(OkHttpClient httpClient, HandshakeStatus handshakeStatus) {
+            this.httpClient = httpClient;
             this.handshakeStatus = handshakeStatus;
         }
 
@@ -662,7 +721,7 @@ public class App {
         protected void setAdditional(ClientOptions.Builder builder) {
             super.setAdditional(builder);
             builder.webSocketFactory(new StatusCapturingWebSocketFactory(
-                deepgramWebSocketHttpClient, handshakeStatus));
+                httpClient, handshakeStatus));
         }
     }
 
