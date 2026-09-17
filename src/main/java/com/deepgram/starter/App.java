@@ -61,7 +61,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.toml.TomlMapper;
 import io.github.cdimascio.dotenv.Dotenv;
 import io.javalin.Javalin;
-import org.eclipse.jetty.websocket.api.WriteCallback;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
 import okhttp3.OkHttpClient;
@@ -70,6 +69,7 @@ import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
+import org.eclipse.jetty.websocket.api.WriteCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -676,10 +676,20 @@ public class App {
                 if (!bridge.isReady()) {
                     reportConnectionFailure(clientCtx, bridge, connectionId,
                         "Deepgram disconnected before the connection was ready", reported, activeConnections);
+                } else {
+                    closeBrowserAfterDeepgramDisconnect(reason, clientCtx, connectionId);
                 }
             });
             return;
         }
+        closeBrowserAfterDeepgramDisconnect(reason, clientCtx, connectionId);
+    }
+
+    private static void closeBrowserAfterDeepgramDisconnect(
+        DisconnectReason reason,
+        WsContext clientCtx,
+        String connectionId
+    ) {
         try {
             if (clientCtx.session.isOpen()) {
                 int safeCode = getSafeCloseCode(reason.getCode());

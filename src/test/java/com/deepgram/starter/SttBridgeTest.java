@@ -233,6 +233,18 @@ class SttBridgeTest {
     }
 
     @Test
+    void earlyDisconnectClosesTheBrowserWhenTheBridgeBecomesReadyDuringTheGracePeriod() {
+        FailureFixture fixture = failureFixture("ready-during-disconnect");
+        var reason = mock(com.deepgram.core.DisconnectReason.class);
+
+        App.handleDeepgramDisconnect(reason, fixture.clientCtx(), fixture.bridge(), fixture.connectionId(),
+            new AtomicBoolean(), fixture.activeConnections());
+        fixture.bridge().markReady();
+
+        verify(fixture.clientCtx(), timeout(1_000)).closeSession(1000, "Deepgram connection closed");
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void earlyDisconnectPreservesTheFollowingHandshakeFailureStatus() throws Exception {
         FailureFixture fixture = failureFixture("early-handshake-disconnect");
