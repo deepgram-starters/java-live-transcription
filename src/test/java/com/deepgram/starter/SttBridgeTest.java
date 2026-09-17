@@ -40,6 +40,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -264,6 +265,7 @@ class SttBridgeTest {
 
         App.handleDeepgramDisconnect(mock(com.deepgram.core.DisconnectReason.class), fixture.clientCtx(),
             fixture.bridge(), fixture.connectionId(), reported, fixture.activeConnections());
+        fixture.bridge().markReady();
         errorHandler.getValue().accept(new RuntimeException("secret"));
 
         ArgumentCaptor<String> frameCaptor = ArgumentCaptor.forClass(String.class);
@@ -274,6 +276,9 @@ class SttBridgeTest {
 
         callbackCaptor.getValue().writeSuccess();
         verify(fixture.clientCtx(), timeout(1_000)).closeSession(1011, "Deepgram connection lost");
+        Thread.sleep(150);
+        verify(fixture.clientCtx(), times(1)).closeSession(1011, "Deepgram connection lost");
+        verify(fixture.clientCtx(), never()).closeSession(1000, "Deepgram connection closed");
     }
 
     @Test

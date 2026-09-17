@@ -673,16 +673,19 @@ public class App {
             // Handshake failures can deliver disconnect before onError. Let onError retain an
             // HTTP status when available, then report an otherwise unexplained early close.
             CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS).execute(() -> {
+                if (reported.get()) return;
                 if (!bridge.isReady()) {
                     reportConnectionFailure(clientCtx, bridge, connectionId,
                         "Deepgram disconnected before the connection was ready", reported, activeConnections);
-                } else {
+                } else if (reported.compareAndSet(false, true)) {
                     closeBrowserAfterDeepgramDisconnect(reason, clientCtx, connectionId);
                 }
             });
             return;
         }
-        closeBrowserAfterDeepgramDisconnect(reason, clientCtx, connectionId);
+        if (reported.compareAndSet(false, true)) {
+            closeBrowserAfterDeepgramDisconnect(reason, clientCtx, connectionId);
+        }
     }
 
     private static void closeBrowserAfterDeepgramDisconnect(
