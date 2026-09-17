@@ -2,10 +2,13 @@ package com.deepgram.starter;
 
 import okio.ByteString;
 import com.deepgram.core.DeepgramHttpException;
+import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.websocket.WsContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.mockito.ArgumentCaptor;
 import org.eclipse.jetty.websocket.api.RemoteEndpoint;
@@ -14,7 +17,9 @@ import org.eclipse.jetty.websocket.api.WriteCallback;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -132,61 +137,81 @@ class SttBridgeTest {
             new RuntimeException(new DeepgramHttpException("Authorization: Token " + secret, 0, null))));
     }
 
-    @Test
-    void directSdkErrorsCloseOnlyAfterTheErrorFrameIsWritten() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    @SuppressWarnings("unchecked")
+    void registeredDeepgramErrorHandlerQueuesErrorBeforeClosing(boolean writeSucceeds) throws Exception {
+        FailureFixture fixture = failureFixture("direct-sdk-error");
+        CompletableFuture<Void> connection = new CompletableFuture<>();
+        V1ConnectOptions options = mock(V1ConnectOptions.class);
+        when(fixture.deepgram().connect(options)).thenReturn(connection);
+
+        App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
+            fixture.connectionId(), new AtomicBoolean(), fixture.activeConnections());
+
+        ArgumentCaptor<Consumer<Exception>> errorHandler = ArgumentCaptor.forClass(Consumer.class);
+        verify(fixture.deepgram()).onError(errorHandler.capture());
+        errorHandler.getValue().accept(new DeepgramHttpException("secret", 503, null));
+
+        assertErrorQueuedBeforeClose(fixture, "Deepgram rejected the connection (HTTP 503)", writeSucceeds);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void failedConnectCompletionQueuesErrorBeforeClosing(boolean writeSucceeds) throws Exception {
+        FailureFixture fixture = failureFixture("failed-connect");
+        CompletableFuture<Void> connection = new CompletableFuture<>();
+        V1ConnectOptions options = mock(V1ConnectOptions.class);
+        when(fixture.deepgram().connect(options)).thenReturn(connection);
+
+        App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
+            fixture.connectionId(), new AtomicBoolean(), fixture.activeConnections());
+        connection.completeExceptionally(new RuntimeException("secret"));
+
+        assertErrorQueuedBeforeClose(fixture, "Failed to connect to Deepgram", writeSucceeds);
+    }
+
+    private static FailureFixture failureFixture(String connectionId) {
         Session session = mock(Session.class);
         RemoteEndpoint remote = mock(RemoteEndpoint.class);
         when(session.isOpen()).thenReturn(true);
         when(session.getRemote()).thenReturn(remote);
         WsContext clientCtx = spy(new WsContext("/api/live-transcription", session) {});
         V1WebSocketClient deepgram = mock(V1WebSocketClient.class);
-        App.SttBridge bridge = new App.SttBridge(deepgram, "direct-sdk-error", () -> {});
+        App.SttBridge bridge = new App.SttBridge(deepgram, connectionId, () -> {});
         Map<String, WsContext> activeConnections = new HashMap<>();
-        activeConnections.put("direct-sdk-error", clientCtx);
-        ArgumentCaptor<WriteCallback> callback = ArgumentCaptor.forClass(WriteCallback.class);
-        InOrder order = inOrder(remote, clientCtx);
-
-        App.reportConnectionFailure(clientCtx, bridge, "direct-sdk-error",
-            App.safeDeepgramConnectionError(new DeepgramHttpException("secret", 503, null)),
-            new AtomicBoolean(), activeConnections);
-
-        order.verify(remote).sendString(eq(App.clientErrorFrame(
-            "Deepgram rejected the connection (HTTP 503)", "CONNECTION_FAILED")), callback.capture());
-        verify(clientCtx, never()).closeSession(1011, "Deepgram connection lost");
-
-        callback.getValue().writeSuccess();
-
-        order.verify(clientCtx).closeSession(1011, "Deepgram connection lost");
-        verify(deepgram).disconnect();
-        assertFalse(activeConnections.containsKey("direct-sdk-error"));
+        activeConnections.put(connectionId, clientCtx);
+        return new FailureFixture(connectionId, clientCtx, remote, deepgram, bridge, activeConnections);
     }
 
-    @Test
-    void failedConnectClosesOnlyAfterTheErrorFrameWriteFails() throws Exception {
-        Session session = mock(Session.class);
-        RemoteEndpoint remote = mock(RemoteEndpoint.class);
-        when(session.isOpen()).thenReturn(true);
-        when(session.getRemote()).thenReturn(remote);
-        WsContext clientCtx = spy(new WsContext("/api/live-transcription", session) {});
-        V1WebSocketClient deepgram = mock(V1WebSocketClient.class);
-        App.SttBridge bridge = new App.SttBridge(deepgram, "failed-connect", () -> {});
-        Map<String, WsContext> activeConnections = new HashMap<>();
-        activeConnections.put("failed-connect", clientCtx);
+    private static void assertErrorQueuedBeforeClose(
+        FailureFixture fixture,
+        String description,
+        boolean writeSucceeds
+    ) throws Exception {
         ArgumentCaptor<WriteCallback> callback = ArgumentCaptor.forClass(WriteCallback.class);
-        InOrder order = inOrder(remote, clientCtx);
+        InOrder order = inOrder(fixture.remote(), fixture.clientCtx());
 
-        App.reportConnectionFailure(clientCtx, bridge, "failed-connect",
-            App.safeDeepgramConnectionError(new RuntimeException("secret")),
-            new AtomicBoolean(), activeConnections);
+        order.verify(fixture.remote()).sendString(eq(App.clientErrorFrame(description, "CONNECTION_FAILED")), callback.capture());
+        verify(fixture.clientCtx(), never()).closeSession(1011, "Deepgram connection lost");
 
-        order.verify(remote).sendString(eq(App.clientErrorFrame(
-            "Failed to connect to Deepgram", "CONNECTION_FAILED")), callback.capture());
-        verify(clientCtx, never()).closeSession(1011, "Deepgram connection lost");
+        if (writeSucceeds) {
+            callback.getValue().writeSuccess();
+        } else {
+            callback.getValue().writeFailed(new RuntimeException("write failed"));
+        }
 
-        callback.getValue().writeFailed(new RuntimeException("write failed"));
-
-        order.verify(clientCtx).closeSession(1011, "Deepgram connection lost");
-        verify(deepgram).disconnect();
-        assertFalse(activeConnections.containsKey("failed-connect"));
+        order.verify(fixture.clientCtx()).closeSession(1011, "Deepgram connection lost");
+        verify(fixture.deepgram()).disconnect();
+        assertFalse(fixture.activeConnections().containsKey(fixture.connectionId()));
     }
+
+    private record FailureFixture(
+        String connectionId,
+        WsContext clientCtx,
+        RemoteEndpoint remote,
+        V1WebSocketClient deepgram,
+        App.SttBridge bridge,
+        Map<String, WsContext> activeConnections
+    ) {}
 }

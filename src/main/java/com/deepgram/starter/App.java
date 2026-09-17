@@ -290,17 +290,6 @@ public class App {
                     forwardRaw(clientCtx, connectionId, raw);
                 });
 
-                dg.onError(error -> {
-                    if (bridge.consumeExpectedDecoderError()) {
-                        log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
-                        return;
-                    }
-                    String description = safeDeepgramConnectionError(error);
-                    log.error("[{}] Deepgram transport error: {}", connectionId, description);
-                    reportConnectionFailure(clientCtx, bridge, connectionId, description,
-                        connectionFailureReported, activeConnections);
-                });
-
                 dg.onDisconnected(reason -> {
                     log.info("[{}] Deepgram connection closed: {} {}", connectionId, reason.getCode(), reason.getReason());
                     // SDK handshake failures emit close before error; wait for that error so the
@@ -330,17 +319,8 @@ public class App {
                 dg.reconnectOptions(ReconnectingWebSocketListener.ReconnectOptions.builder()
                     .maxRetries(0)
                     .build());
-                dg.connect(options).whenComplete((v, err) -> {
-                    if (err != null) {
-                        String description = safeDeepgramConnectionError(err);
-                        log.error("[{}] Failed to connect to Deepgram: {}", connectionId, description);
-                        reportConnectionFailure(clientCtx, bridge, connectionId, description,
-                            connectionFailureReported, activeConnections);
-                        return;
-                    }
-                    // Flush any audio the browser sent before the Deepgram socket opened.
-                    bridge.markReady();
-                });
+                connectWithFailureReporting(dg, options, clientCtx, bridge, connectionId,
+                    connectionFailureReported, activeConnections);
             });
 
             ws.onMessage(clientCtx -> {
@@ -580,7 +560,37 @@ public class App {
         return "Failed to connect to Deepgram";
     }
 
-    static void reportConnectionFailure(
+    static void connectWithFailureReporting(
+        V1WebSocketClient dg,
+        V1ConnectOptions options,
+        WsContext clientCtx,
+        SttBridge bridge,
+        String connectionId,
+        AtomicBoolean reported,
+        Map<String, WsContext> activeConnections
+    ) {
+        dg.onError(error -> {
+            if (bridge.consumeExpectedDecoderError()) {
+                log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
+                return;
+            }
+            String description = safeDeepgramConnectionError(error);
+            log.error("[{}] Deepgram transport error: {}", connectionId, description);
+            reportConnectionFailure(clientCtx, bridge, connectionId, description, reported, activeConnections);
+        });
+        dg.connect(options).whenComplete((v, err) -> {
+            if (err != null) {
+                String description = safeDeepgramConnectionError(err);
+                log.error("[{}] Failed to connect to Deepgram: {}", connectionId, description);
+                reportConnectionFailure(clientCtx, bridge, connectionId, description, reported, activeConnections);
+                return;
+            }
+            // Flush any audio the browser sent before the Deepgram socket opened.
+            bridge.markReady();
+        });
+    }
+
+    private static void reportConnectionFailure(
         WsContext clientCtx,
         SttBridge bridge,
         String connectionId,
