@@ -310,7 +310,7 @@ public class App {
                 dg.onConnected(() -> log.info("[{}] Connected to Deepgram STT API", connectionId));
                 dg.onMessage(raw -> {
                     if (!isModeledInboundEvent(raw)) {
-                        bridge.expectDecoderError();
+                        bridge.expectDecoderError(raw);
                     }
                     forwardRaw(clientCtx, connectionId, raw);
                 });
@@ -614,7 +614,7 @@ public class App {
         Map<String, WsContext> activeConnections
     ) {
         dg.onError(error -> {
-            if (bridge.consumeExpectedDecoderError()) {
+            if (bridge.consumeExpectedDecoderError(error)) {
                 log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
                 return;
             }
@@ -891,7 +891,7 @@ public class App {
         private final Runnable onOverload;
         private boolean ready = false;
         private boolean closed = false;
-        private boolean expectingDecoderError = false;
+        private String expectedDecoderErrorMessage;
         private long pendingBytes = 0;
         private final List<PendingFrame> pending = new ArrayList<>();
 
@@ -923,14 +923,19 @@ public class App {
             return true;
         }
 
-        synchronized void expectDecoderError() {
-            expectingDecoderError = true;
+        synchronized void expectDecoderError(String raw) {
+            expectedDecoderErrorMessage = "Unrecognized WebSocket message: "
+                + raw.substring(0, Math.min(200, raw.length()))
+                + "... Update your SDK version to support new message types.";
         }
 
-        synchronized boolean consumeExpectedDecoderError() {
-            boolean expected = expectingDecoderError;
-            expectingDecoderError = false;
-            return expected;
+        synchronized boolean consumeExpectedDecoderError(Exception error) {
+            if (expectedDecoderErrorMessage == null
+                || !expectedDecoderErrorMessage.equals(error.getMessage())) {
+                return false;
+            }
+            expectedDecoderErrorMessage = null;
+            return true;
         }
 
         private boolean enqueue(PendingFrame frame, long bytes) {

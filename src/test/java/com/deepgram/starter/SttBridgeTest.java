@@ -82,6 +82,20 @@ class SttBridgeTest {
     }
 
     @Test
+    void onlySuppressesTheDecoderErrorForTheForwardedUnknownEvent() {
+        App.SttBridge bridge = new App.SttBridge(null, "test", () -> {});
+        String raw = "{\"type\":\"NewEvent\"}";
+
+        bridge.expectDecoderError(raw);
+
+        assertFalse(bridge.consumeExpectedDecoderError(new RuntimeException("connection reset")));
+        assertTrue(bridge.consumeExpectedDecoderError(new RuntimeException(
+            "Unrecognized WebSocket message: " + raw + "... Update your SDK version to support new message types.")));
+        assertFalse(bridge.consumeExpectedDecoderError(new RuntimeException(
+            "Unrecognized WebSocket message: " + raw + "... Update your SDK version to support new message types.")));
+    }
+
+    @Test
     void flushesQueuedFramesThroughTheSdkInArrivalOrder() {
         V1WebSocketClient deepgram = mock(V1WebSocketClient.class);
         ByteString audio = ByteString.of(new byte[] {1, 2, 3});
