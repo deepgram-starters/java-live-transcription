@@ -1,11 +1,18 @@
 package com.deepgram.starter;
 
 import okio.ByteString;
+import com.deepgram.core.ClientOptions;
 import com.deepgram.core.DeepgramHttpException;
+import com.deepgram.core.Environment;
+import com.deepgram.core.ReconnectingWebSocketListener;
+import com.deepgram.types.ListenV1Model;
 import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.websocket.WsContext;
+import okhttp3.OkHttpClient;
+import okhttp3.mockwebserver.MockResponse;
+import okhttp3.mockwebserver.MockWebServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -18,6 +25,7 @@ import org.eclipse.jetty.websocket.api.WriteCallback;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -30,6 +38,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -147,7 +156,7 @@ class SttBridgeTest {
         when(fixture.deepgram().connect(options)).thenReturn(connection);
 
         App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
-            fixture.connectionId(), new AtomicBoolean(), fixture.activeConnections());
+            fixture.connectionId(), new App.HandshakeStatus(), new AtomicBoolean(), fixture.activeConnections());
 
         ArgumentCaptor<Consumer<Exception>> errorHandler = ArgumentCaptor.forClass(Consumer.class);
         verify(fixture.deepgram()).onError(errorHandler.capture());
@@ -165,10 +174,53 @@ class SttBridgeTest {
         when(fixture.deepgram().connect(options)).thenReturn(connection);
 
         App.connectWithFailureReporting(fixture.deepgram(), options, fixture.clientCtx(), fixture.bridge(),
-            fixture.connectionId(), new AtomicBoolean(), fixture.activeConnections());
+            fixture.connectionId(), new App.HandshakeStatus(), new AtomicBoolean(), fixture.activeConnections());
         connection.completeExceptionally(new RuntimeException("secret"));
 
         assertErrorQueuedBeforeClose(fixture, "Failed to connect to Deepgram", writeSucceeds);
+    }
+
+    @Test
+    void invalidKeyHandshakeReportsCapturedStatusBeforeClosing() throws Exception {
+        String apiKey = "deterministic-invalid-key";
+        try (MockWebServer server = new MockWebServer()) {
+            server.enqueue(new MockResponse().setResponseCode(401).setBody("unauthorized"));
+            server.start();
+
+            App.HandshakeStatus handshakeStatus = new App.HandshakeStatus();
+            V1WebSocketClient deepgram = new V1WebSocketClient(ClientOptions.builder()
+                .environment(Environment.custom().production(server.url("/").toString()).build())
+                .addHeader("Authorization", "Token " + apiKey)
+                .webSocketFactory(new App.StatusCapturingWebSocketFactory(new OkHttpClient(), handshakeStatus))
+                .build());
+            deepgram.reconnectOptions(ReconnectingWebSocketListener.ReconnectOptions.builder()
+                .maxRetries(0)
+                .build());
+            FailureFixture fixture = failureFixture("invalid-key-handshake");
+            V1ConnectOptions options = V1ConnectOptions.builder()
+                .model(ListenV1Model.valueOf("nova-3"))
+                .build();
+
+            App.connectWithFailureReporting(deepgram, options, fixture.clientCtx(), fixture.bridge(),
+                fixture.connectionId(), handshakeStatus, new AtomicBoolean(), fixture.activeConnections());
+
+            ArgumentCaptor<String> frameCaptor = ArgumentCaptor.forClass(String.class);
+            ArgumentCaptor<WriteCallback> callbackCaptor = ArgumentCaptor.forClass(WriteCallback.class);
+            verify(fixture.remote(), timeout(5_000)).sendString(frameCaptor.capture(), callbackCaptor.capture());
+
+            var frame = new ObjectMapper().readTree(frameCaptor.getValue());
+            assertEquals("Error", frame.path("type").asText());
+            assertEquals("Deepgram rejected the connection (HTTP 401)", frame.path("description").asText());
+            assertEquals("CONNECTION_FAILED", frame.path("error").path("code").asText());
+            assertFalse(frameCaptor.getValue().contains(apiKey));
+            assertFalse(frameCaptor.getValue().contains("Authorization"));
+            verify(fixture.clientCtx(), never()).closeSession(1011, "Deepgram connection lost");
+
+            callbackCaptor.getValue().writeSuccess();
+
+            verify(fixture.clientCtx(), timeout(5_000)).closeSession(1011, "Deepgram connection lost");
+            assertEquals("Token " + apiKey, server.takeRequest(5, TimeUnit.SECONDS).getHeader("Authorization"));
+        }
     }
 
     private static FailureFixture failureFixture(String connectionId) {

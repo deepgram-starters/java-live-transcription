@@ -33,9 +33,12 @@ import com.auth0.jwt.JWTVerifier;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.deepgram.DeepgramClient;
+import com.deepgram.DeepgramClientBuilder;
+import com.deepgram.core.ClientOptions;
 import com.deepgram.core.DeepgramHttpException;
 import com.deepgram.core.ObjectMappers;
 import com.deepgram.core.ReconnectingWebSocketListener;
+import com.deepgram.core.WebSocketFactory;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStream;
 import com.deepgram.resources.listen.v1.types.ListenV1CloseStreamType;
 import com.deepgram.resources.listen.v1.types.ListenV1Finalize;
@@ -58,6 +61,11 @@ import io.javalin.Javalin;
 import org.eclipse.jetty.websocket.api.WriteCallback;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 import okio.ByteString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,6 +75,8 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 // ============================================================================
@@ -91,8 +101,16 @@ public class App {
     /** Track active client WebSocket sessions for graceful shutdown. */
     private static final Map<String, WsContext> activeConnections = new ConcurrentHashMap<>();
 
-    /** Shared Deepgram SDK client for outbound connections to Deepgram. */
-    private static DeepgramClient deepgram;
+    /** API key used to create an isolated Deepgram client for each browser connection. */
+    private static String deepgramApiKey;
+
+    /** Shared HTTP transport used by the SDK WebSocketFactory extension point. */
+    private static final OkHttpClient deepgramWebSocketHttpClient = new OkHttpClient.Builder()
+        .callTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(0, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)
+        .build();
 
     /** JWT signing algorithm. */
     private static Algorithm jwtAlgorithm;
@@ -165,7 +183,7 @@ public class App {
         // DEEPGRAM SDK CLIENT SETUP
         // ====================================================================
 
-        deepgram = DeepgramClient.builder().apiKey(deepgramApiKey).build();
+        App.deepgramApiKey = deepgramApiKey;
 
         // ====================================================================
         // JAVALIN SERVER SETUP
@@ -266,8 +284,11 @@ public class App {
                 log.info("[{}] Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
                     connectionId, model, language, encoding, sampleRate, channels);
 
-                // Create a per-connection Deepgram SDK WebSocket client.
-                V1WebSocketClient dg = deepgram.listen().v1().v1WebSocket();
+                // SDK 0.7.1 drops the non-2xx handshake Response before invoking
+                // onError. Capture only its numeric status through the documented
+                // WebSocketFactory extension point, retaining no request or headers.
+                HandshakeStatus handshakeStatus = new HandshakeStatus();
+                V1WebSocketClient dg = createDeepgramWebSocketClient(handshakeStatus);
                 SttBridge bridge = new SttBridge(dg, connectionId, () -> {
                     try {
                         if (clientCtx.session.isOpen()) {
@@ -320,7 +341,7 @@ public class App {
                     .maxRetries(0)
                     .build());
                 connectWithFailureReporting(dg, options, clientCtx, bridge, connectionId,
-                    connectionFailureReported, activeConnections);
+                    handshakeStatus, connectionFailureReported, activeConnections);
             });
 
             ws.onMessage(clientCtx -> {
@@ -549,10 +570,20 @@ public class App {
 
     /** Returns provider connection errors without exposing SDK request details. */
     static String safeDeepgramConnectionError(Throwable error) {
+        return safeDeepgramConnectionError(error, null);
+    }
+
+    static String safeDeepgramConnectionError(Throwable error, HandshakeStatus handshakeStatus) {
+        if (handshakeStatus != null) {
+            OptionalInt statusCode = handshakeStatus.statusCode();
+            if (statusCode.isPresent() && isHttpStatus(statusCode.getAsInt())) {
+                return "Deepgram rejected the connection (HTTP " + statusCode.getAsInt() + ")";
+            }
+        }
         for (Throwable cause = error; cause != null; cause = cause.getCause()) {
             if (cause instanceof DeepgramHttpException httpError) {
                 int statusCode = httpError.statusCode();
-                if (statusCode >= 100 && statusCode <= 599) {
+                if (isHttpStatus(statusCode)) {
                     return "Deepgram rejected the connection (HTTP " + statusCode + ")";
                 }
             }
@@ -566,6 +597,7 @@ public class App {
         WsContext clientCtx,
         SttBridge bridge,
         String connectionId,
+        HandshakeStatus handshakeStatus,
         AtomicBoolean reported,
         Map<String, WsContext> activeConnections
     ) {
@@ -574,13 +606,13 @@ public class App {
                 log.warn("[{}] Ignoring SDK decode error after raw event: {}", connectionId, error.getMessage());
                 return;
             }
-            String description = safeDeepgramConnectionError(error);
+            String description = safeDeepgramConnectionError(error, handshakeStatus);
             log.error("[{}] Deepgram transport error: {}", connectionId, description);
             reportConnectionFailure(clientCtx, bridge, connectionId, description, reported, activeConnections);
         });
         dg.connect(options).whenComplete((v, err) -> {
             if (err != null) {
-                String description = safeDeepgramConnectionError(err);
+                String description = safeDeepgramConnectionError(err, handshakeStatus);
                 log.error("[{}] Failed to connect to Deepgram: {}", connectionId, description);
                 reportConnectionFailure(clientCtx, bridge, connectionId, description, reported, activeConnections);
                 return;
@@ -588,6 +620,97 @@ public class App {
             // Flush any audio the browser sent before the Deepgram socket opened.
             bridge.markReady();
         });
+    }
+
+    private static boolean isHttpStatus(int statusCode) {
+        return statusCode >= 100 && statusCode <= 599;
+    }
+
+    private static V1WebSocketClient createDeepgramWebSocketClient(HandshakeStatus handshakeStatus) {
+        DeepgramClient client = new HandshakeAwareDeepgramClientBuilder(handshakeStatus)
+            .apiKey(deepgramApiKey)
+            .httpClient(deepgramWebSocketHttpClient)
+            .build();
+        return client.listen().v1().v1WebSocket();
+    }
+
+    /** Retains only a handshake response status so headers and bodies cannot be exposed later. */
+    static final class HandshakeStatus {
+        private final AtomicInteger statusCode = new AtomicInteger();
+
+        void capture(Response response) {
+            if (response != null) {
+                statusCode.set(response.code());
+            }
+        }
+
+        OptionalInt statusCode() {
+            int captured = statusCode.get();
+            return captured == 0 ? OptionalInt.empty() : OptionalInt.of(captured);
+        }
+    }
+
+    /** Uses the SDK's documented builder extension point to install a per-connection factory. */
+    private static final class HandshakeAwareDeepgramClientBuilder extends DeepgramClientBuilder {
+        private final HandshakeStatus handshakeStatus;
+
+        private HandshakeAwareDeepgramClientBuilder(HandshakeStatus handshakeStatus) {
+            this.handshakeStatus = handshakeStatus;
+        }
+
+        @Override
+        protected void setAdditional(ClientOptions.Builder builder) {
+            super.setAdditional(builder);
+            builder.webSocketFactory(new StatusCapturingWebSocketFactory(
+                deepgramWebSocketHttpClient, handshakeStatus));
+        }
+    }
+
+    /** Forwards all SDK listener callbacks while recording the handshake status before failure handling. */
+    static final class StatusCapturingWebSocketFactory implements WebSocketFactory {
+        private final OkHttpClient httpClient;
+        private final HandshakeStatus handshakeStatus;
+
+        StatusCapturingWebSocketFactory(OkHttpClient httpClient, HandshakeStatus handshakeStatus) {
+            this.httpClient = httpClient;
+            this.handshakeStatus = handshakeStatus;
+        }
+
+        @Override
+        public WebSocket create(Request request, WebSocketListener listener) {
+            return httpClient.newWebSocket(request, new WebSocketListener() {
+                @Override
+                public void onOpen(WebSocket webSocket, Response response) {
+                    listener.onOpen(webSocket, response);
+                }
+
+                @Override
+                public void onMessage(WebSocket webSocket, String text) {
+                    listener.onMessage(webSocket, text);
+                }
+
+                @Override
+                public void onMessage(WebSocket webSocket, ByteString bytes) {
+                    listener.onMessage(webSocket, bytes);
+                }
+
+                @Override
+                public void onClosing(WebSocket webSocket, int code, String reason) {
+                    listener.onClosing(webSocket, code, reason);
+                }
+
+                @Override
+                public void onClosed(WebSocket webSocket, int code, String reason) {
+                    listener.onClosed(webSocket, code, reason);
+                }
+
+                @Override
+                public void onFailure(WebSocket webSocket, Throwable error, Response response) {
+                    handshakeStatus.capture(response);
+                    listener.onFailure(webSocket, error, response);
+                }
+            });
+        }
     }
 
     private static void reportConnectionFailure(
